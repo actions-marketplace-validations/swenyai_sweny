@@ -90,14 +90,14 @@
     }
   },
   "devDependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.2",
-    "@aws-sdk/client-s3": "^3.1004.0",
-    "@aws-sdk/s3-request-presigner": "^3.1004.0",
+    "@anthropic-ai/claude-agent-sdk": "^0.2.139",
+    "@aws-sdk/client-s3": "^3.1045.0",
+    "@aws-sdk/s3-request-presigner": "^3.1045.0",
     "@types/express": "^5",
-    "@types/node": "^25",
+    "@types/node": "^25.7.0",
     "tsx": "^4",
     "typescript": "^5.6",
-    "vitest": "^4"
+    "vitest": "^4.1.6"
   },
   "keywords": [
     "ai",
