@@ -1,5 +1,219 @@
 # @sweny-ai/studio
 
+## 8.0.0
+
+### Patch Changes
+
+- @sweny-ai/engine@6.0.0
+
+## 7.0.0
+
+### Patch Changes
+
+- @sweny-ai/engine@5.0.0
+
+## 6.0.0
+
+### Patch Changes
+
+- @sweny-ai/engine@4.0.0
+
+## 5.3.2
+
+### Patch Changes
+
+- b3e16fd: Fix multiple correctness and security issues found in code review
+
+  **@sweny-ai/providers**
+  - `file.ts`: Replace `execSync` string interpolation with `execFileSync` + args array,
+    eliminating command injection risk from branch names, commit messages, and file paths
+  - `github.ts`, `gitlab.ts`: Escape `searchTerm` before use in `new RegExp()` to prevent
+    incorrect matching or ReDoS on identifiers containing regex metacharacters
+  - `github-issues.ts`: Return issue `number` (not internal node `id`) from `createIssue`,
+    `searchIssues`, and `getIssue` — all GitHub REST API endpoints that accept an issue
+    reference expect the issue number, not the internal 9-digit node ID
+  - `linear.ts`: Fix multi-label filter to use `{ some: { id: { in: labels } } }` instead
+    of `{ id: { eq: labels[0] } }` which silently dropped all but the first label
+  - `jira.ts`: Escape user-supplied values before embedding in JQL strings to prevent
+    injection via `projectId`, `query`, `labels`, and `states` parameters
+
+  **@sweny-ai/engine**
+  - `implement-fix.ts`: Remove unreachable dead code — the `issueOverride` + non-open PR
+    branch was nulled out before the check that used it; logic now correctly lets issue
+    override bypass the duplicate-PR skip
+  - `risk-assessor.ts`: Fix lockfile/`package.json` patterns to match nested paths
+    (e.g. `packages/engine/package.json`) — anchored `^...$` patterns only matched
+    root-level files
+  - `cross-repo-check.ts`: Report `dispatched: false` when `dispatchWorkflow` throws
+    instead of returning `{ dispatched: true }` on a failed dispatch
+
+  **@sweny-ai/studio**
+  - `WorkflowViewer.tsx`: Memoize `validateWorkflow` result via `useMemo` — was called
+    4× per definition change (once per effect × two helper functions); now computed once
+  - `App.tsx`: Guard global keyboard shortcuts so they don't fire while the user is
+    typing in an `<input>`, `<textarea>`, or `contentEditable` element
+
+- Updated dependencies [b2eb6e7]
+- Updated dependencies [b3e16fd]
+  - @sweny-ai/engine@3.2.5
+
+## 5.3.1
+
+### Patch Changes
+
+- a7ab63e: Add missing npm package metadata: keywords, bugs URL, and description improvements across all published packages. Fix engine description to say "Workflow" (not "Recipe"). Align Node.js engine requirement for cli and agent to >=22.0.0 to match providers (which uses global fetch).
+- ce6000b: Add README with installation, quick-start example, live execution highlighting,
+  and API docs for the WorkflowViewer component.
+- Updated dependencies [a7ab63e]
+  - @sweny-ai/engine@3.2.2
+
+## 5.3.0
+
+### Minor Changes
+
+- eac9979: - feat(studio): execution trace panel + rename RecipeViewer → WorkflowViewer
+
+### Patch Changes
+
+- 2deee05: - fix: review fixes — stderr, shape guard, parse helper, PropertiesPanel IIFE
+- Updated dependencies [2deee05]
+  - @sweny-ai/engine@3.2.1
+
+## 5.2.0
+
+### Minor Changes
+
+- 87a7fa6: Unreachable steps are now visually highlighted in the workflow graph with a dashed orange border and warning badge. Clicking a validation error in the banner selects the affected step. The properties panel shows an actionable warning for unreachable steps.
+
+## 5.1.0
+
+### Minor Changes
+
+- e810ddc: New "↓ GitHub Actions" export button generates a ready-to-commit `.github/workflows/sweny-{id}.yml` with daily schedule, manual dispatch trigger, and auto-detected secret placeholders based on the step types in your workflow.
+
+## 5.0.0
+
+### Patch Changes
+
+- Updated dependencies [46d6e86]
+  - @sweny-ai/engine@3.2.0
+
+## 4.0.0
+
+### Minor Changes
+
+- 17ce7ac: Simulate mode now has an "Auto-run" button that runs all steps as stubs (always success), making it easy to visualize the full execution flow of any workflow — including custom workflows — without manual stepping.
+- da1d38a: Steps can now be renamed directly in the PropertiesPanel. Renaming cascades
+  all transition targets (`next`, `on`, and `initial`) throughout the definition.
+- 943fc8d: The Studio toolbar now has a "↓ TypeScript" export button. Downloads a `.ts`
+  file with the workflow definition typed as `WorkflowDefinition` and per-step
+  implementation stubs, ready to use with `@sweny-ai/engine`.
+
+### Patch Changes
+
+- 1b11317: Add first-time user onboarding: empty-state overlay when no steps exist, keyboard shortcuts help panel (? key), and TypeScript export button in the toolbar.
+- Updated dependencies [2af077b]
+- Updated dependencies [9325572]
+  - @sweny-ai/engine@3.1.0
+
+## 3.3.0
+
+### Minor Changes
+
+- 65c467f: StepPanel now shows a "Step type" dropdown with all built-in step types.
+  Selecting a type auto-sets the step's phase to the type's canonical phase and
+  shows the type's description as a hint below the dropdown. Provider role badges
+  (e.g., `observability`, `sourceControl`) appear for types that declare them.
+  Selecting "— none (custom) —" clears the `type` field.
+
+### Patch Changes
+
+- caf64a7: `WORKFLOW_YAML_SCHEMA_HEADER` is now exported from `@sweny-ai/engine/browser`
+  (the browser-safe entry). Studio's `export-yaml` now imports from the browser
+  entry, ensuring the export YAML path pulls zero Node.js transitive dependencies.
+- f5ae307: EdgePanel and WorkflowMetaPanel are now read-only in simulate/live mode.
+  Previously, clicking an edge or de-selecting a node while a simulation was
+  running allowed editing transitions and workflow metadata. All inputs are now
+  disabled and the "Delete transition" button is hidden during execution.
+- Updated dependencies [caf64a7]
+  - @sweny-ai/engine@3.0.3
+
+## 3.2.1
+
+### Patch Changes
+
+- c4d709a: Fix schema publication, semver validation, and shared schema header constant.
+  - `schema/` directory now included in engine package `files` so `@sweny-ai/engine/schema`
+    actually ships to npm consumers (was silently missing before)
+  - JSON Schema semver regex now anchored with `$` — previously allowed trailing
+    garbage like `"1.0.0-junk!!!"` to pass validation
+  - `WORKFLOW_YAML_SCHEMA_HEADER` exported from `@sweny-ai/engine` so CLI and Studio
+    import a single source of truth instead of duplicating the URL string
+  - Added schema tests: pre-release labels, build metadata, `type` field acceptance,
+    unknown extra property rejection, end-anchor semver check
+
+- Updated dependencies [c4d709a]
+  - @sweny-ai/engine@3.0.2
+
+## 3.2.0
+
+### Minor Changes
+
+- 3375a00: PropertiesPanel now shows an execution result card in simulate/live mode.
+  Clicking a completed step displays status icon, outcome badge, reason, and
+  optionally the full output data (expandable). Running steps show a pulsing
+  indicator; pending steps show "pending". All design controls become read-only
+  (disabled, not hidden) during execution so the workflow definition stays visible.
+
+### Patch Changes
+
+- 7f284ff: JSON Schema for workflow YAML updated and renamed to `workflow-definition.schema.json`.
+  Added the `type` field for built-in step types with known values as examples.
+  CLI `sweny workflow export` and Studio's Export YAML button now include a
+  `# yaml-language-server: $schema=...` header — VS Code auto-completes and
+  validates workflow YAML files with no extra setup.
+- Updated dependencies [dc62460]
+- Updated dependencies [7f284ff]
+  - @sweny-ai/engine@3.0.1
+
+## 3.1.0
+
+### Minor Changes
+
+- 7b823fb: Simulation and Live modes now show a step-by-step execution trace panel with
+  icons (✓/✗/⊘), step IDs, `data.outcome` badges, and `reason` text — so
+  debugging a workflow no longer requires reading server logs.
+
+  Internal: `RecipeViewer` component renamed to `WorkflowViewer` for
+  consistency with the rest of the workflow terminology.
+
+## 3.0.0
+
+### Major Changes
+
+- 815d361: **Breaking**: Studio public exports renamed to workflow terminology.
+  - `RecipeViewer` → `WorkflowViewer`
+  - `RecipeViewerProps` → `WorkflowViewerProps`
+  - Studio now listens for `workflow:start`, `step:enter`, `step:exit`, `workflow:end` events (matching engine v2)
+  - Internal store fields: `currentStepId`, `completedSteps`, `updateWorkflowMeta`
+
+  CLI: updated to use `runWorkflow`, `triageWorkflow`, `implementWorkflow` from engine (no user-facing change).
+
+### Minor Changes
+
+- e36f470: Studio is now the GUI for declarative YAML workflows.
+  - **Step type picker**: select built-in step types (sweny/investigate, sweny/create-pr, etc.) when adding nodes — pre-populates phase, uses, and type fields
+  - **YAML export**: primary export is now workflow YAML (compatible with `sweny workflow run`); JSON export kept as secondary
+  - **YAML import**: Import modal accepts YAML or JSON paste
+  - **Fork UX**: one-click fork of built-in workflows (triage, implement) into editable custom workflow
+  - **Step type display**: nodes show their type label as subtitle
+
+### Patch Changes
+
+- Updated dependencies [1204f4f]
+- Updated dependencies [93e7710]
+  - @sweny-ai/engine@3.0.0
+
 ## 2.0.0
 
 ### Minor Changes

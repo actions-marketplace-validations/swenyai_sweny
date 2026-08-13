@@ -23,20 +23,30 @@ We will acknowledge your report within 48 hours and aim to release a fix within 
 
 ## Scope
 
-This policy covers the SWEny monorepo: the GitHub Action, `@sweny-ai/providers`, `@sweny-ai/agent`, and the sweny.ai website.
+This policy covers the SWEny monorepo: the CLI (`@sweny-ai/core`), GitHub Action (`@sweny-ai/action`), Studio (`@sweny-ai/studio`), MCP server (`@sweny-ai/mcp`), and the docs/spec sites.
 
 ## Credential Handling
 
-SWEny never stores credentials in code. All secrets are read from environment variables or secret managers at runtime. If you believe a credential has been exposed, rotate it immediately and notify us.
+SWEny never stores credentials in code. All secrets are read from environment variables at runtime. If you believe a credential has been exposed, rotate it immediately and notify us.
 
-## Open-Source Worker and Audit Path
+## Execution Model
 
-The `packages/worker` binary is open source so customers can audit every line of code that executes their jobs. Build reproducibility is maintained via pinned base images and `npm ci --frozen-lockfile`.
+SWEny runs entirely in your environment: your terminal, your CI runner, your compute.
 
-To verify that the worker running in production matches the published source:
+The CLI ships an opt-in run reporting path that sends structured metadata only (run status, duration, recommendations) and never source code, diffs, or secrets. It is gated on `SWENY_CLOUD_TOKEN` and returns immediately when that variable is unset, so a default install makes no outbound request. Token minting is not currently exposed; the hosted service is in active development. See [PRIVACY.md](./PRIVACY.md) for the exact payload.
+
+## Open-Source Worker Audit Path (aws-cloud — not yet live)
+
+> The managed execution model described below is from
+> [aws-cloud](https://github.com/swenyai/aws-cloud) and is not part of the current
+> cloud product. It may be revisited in the future.
+
+The worker binary is open source so customers can audit every line of code that executes their jobs. Build reproducibility is maintained via pinned base images and `npm ci --frozen-lockfile`.
+
+To verify that a worker image matches the published source:
 
 1. Check the Docker image SHA256 on the job detail page (or via `GET /orgs/:orgId/jobs/:jobId/attestation` on Enterprise).
 2. Compare against the published image digest on the GitHub Container Registry page for the matching release tag.
-3. Reproduce the build locally with `packages/worker/verify-build.sh <image> <tag>` and confirm the manifest digest matches.
+3. Reproduce the build locally with `verify-build.sh <image> <tag>` and confirm the manifest digest matches.
 
 The audit trail from source commit → Docker image → running job is maintained in the release pipeline. Enterprise customers additionally receive a signed AWS Nitro attestation document for each job.

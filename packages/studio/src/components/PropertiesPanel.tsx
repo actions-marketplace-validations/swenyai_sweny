@@ -1,367 +1,543 @@
-import { useState } from "react";
-import type { WorkflowPhase } from "@sweny-ai/engine";
+import { useState, useMemo, useCallback, useEffect, useRef } from "react";
+import type { Node, NodeResult, Source } from "@sweny-ai/core";
+import { validateWorkflow } from "@sweny-ai/core/schema";
+import { getSkillCatalog } from "@sweny-ai/core/studio";
 import { useEditorStore } from "../store/editor-store.js";
+import { SkillIcon } from "./SkillIcon.js";
+import { InstructionEditor } from "./InstructionEditor.js";
+import { generateInstruction } from "../lib/generate-instruction.js";
+
+const skillCatalog = getSkillCatalog();
+
+// Derive the editable {sourceKind, value} pair from a node's `instruction`
+// Source (a plain string is inline; an object carries file/url/inline). Kept as
+// pure module-level helpers so both the initial seed and the sync effect agree.
+function deriveSourceKind(src: Node["instruction"]): "inline" | "file" | "url" {
+  if (typeof src === "string") {
+    const t = src.trim();
+    if (t.startsWith("http://") || t.startsWith("https://")) return "url";
+    if (t.startsWith("./") || t.startsWith("../") || t.startsWith("/")) return "file";
+    return "inline";
+  }
+  if ("url" in src) return "url";
+  if ("file" in src) return "file";
+  return "inline";
+}
+
+function deriveInstructionValue(src: Node["instruction"]): string {
+  if (typeof src === "string") return src;
+  if ("inline" in src) return src.inline;
+  if ("file" in src) return src.file;
+  if ("url" in src) return src.url;
+  return "";
+}
 
 export function PropertiesPanel() {
   const {
-    definition,
+    workflow,
     selection,
     setSelection,
-    updateState,
-    updateRecipeMeta,
-    deleteState,
-    setInitial,
-    addTransition,
-    updateTransitionOutcome,
-    updateTransitionTarget,
-    deleteTransition,
+    updateNode,
+    updateWorkflowMeta,
+    deleteNode,
+    renameNode,
+    setEntry,
+    updateEdge,
+    deleteEdge,
+    mode,
+    completedNodes,
+    currentNodeId,
   } = useEditorStore();
 
-  const stateIds = Object.keys(definition.states);
+  const readOnly = mode !== "design";
 
-  if (selection?.kind === "state") {
+  const nodeIds = Object.keys(workflow.nodes);
+  const unreachableIds = useMemo(
+    () =>
+      new Set(
+        validateWorkflow(workflow)
+          .filter((e) => e.code === "UNREACHABLE_NODE" && e.nodeId)
+          .map((e) => e.nodeId!),
+      ),
+    [workflow],
+  );
+
+  if (selection?.kind === "node") {
     const { id } = selection;
-    const state = definition.states[id];
-    if (!state) return <EmptyPanel />;
+    const node = workflow.nodes[id];
+    if (!node) return <EmptyPanel />;
+    const execResult = completedNodes[id] as NodeResult | undefined;
+    const isRunning = id === currentNodeId;
+    const isUnreachable = unreachableIds.has(id);
     return (
-      <StatePanel
+      <NodePanel
         key={id}
         id={id}
-        state={state}
-        stateIds={stateIds}
-        isInitial={definition.initial === id}
-        updateState={updateState}
-        setInitial={setInitial}
-        deleteState={(sid) => {
-          if (window.confirm(`Delete state "${sid}"?`)) {
-            deleteState(sid);
+        node={node}
+        nodeIds={nodeIds}
+        isEntry={workflow.entry === id}
+        isUnreachable={isUnreachable}
+        readOnly={readOnly}
+        execResult={execResult}
+        isRunning={isRunning}
+        updateNode={updateNode}
+        renameNode={renameNode}
+        setEntry={setEntry}
+        deleteNode={(nid) => {
+          if (window.confirm(`Delete node "${nid}"?`)) {
+            deleteNode(nid);
           }
         }}
-        addTransition={addTransition}
-        updateTransitionOutcome={updateTransitionOutcome}
-        updateTransitionTarget={updateTransitionTarget}
-        deleteTransition={deleteTransition}
       />
     );
   }
 
   if (selection?.kind === "edge") {
-    const { source, outcome } = selection;
-    const sourceState = definition.states[source];
-    let currentTarget = "";
-    if (outcome === "→") {
-      currentTarget = sourceState?.next ?? "";
-    } else {
-      currentTarget = sourceState?.on?.[outcome] ?? "";
-    }
+    const { id: edgeId, edgeIndex, from, to } = selection;
+    const edge = workflow.edges[edgeIndex];
     return (
       <EdgePanel
-        key={`${source}--${outcome}`}
-        source={source}
-        outcome={outcome}
-        currentTarget={currentTarget}
-        stateIds={stateIds}
-        updateTransitionOutcome={updateTransitionOutcome}
-        updateTransitionTarget={updateTransitionTarget}
-        deleteTransition={(src, out) => {
-          deleteTransition(src, out);
+        key={edgeId}
+        edgeIndex={edgeIndex}
+        from={from}
+        to={to}
+        when={edge?.when ?? ""}
+        maxIterations={edge?.max_iterations}
+        nodeIds={nodeIds}
+        readOnly={readOnly}
+        updateEdge={updateEdge}
+        deleteEdge={(idx) => {
+          deleteEdge(idx);
           setSelection(null);
         }}
       />
     );
   }
 
-  // Nothing selected — recipe meta
-  return <RecipeMetaPanel definition={definition} updateRecipeMeta={updateRecipeMeta} />;
+  // Nothing selected — workflow meta
+  return <WorkflowMetaPanel />;
 }
 
 // ─────────────────────────────────────────────
-// Recipe meta panel
+// Workflow meta panel
 // ─────────────────────────────────────────────
 
-interface RecipeMetaPanelProps {
-  definition: ReturnType<typeof useEditorStore.getState>["definition"];
-  updateRecipeMeta: ReturnType<typeof useEditorStore.getState>["updateRecipeMeta"];
-}
-
-function RecipeMetaPanel({ definition, updateRecipeMeta }: RecipeMetaPanelProps) {
-  const [name, setName] = useState(definition.name ?? "");
-  const [description, setDescription] = useState(definition.description ?? "");
-  const [version, setVersion] = useState(definition.version ?? "");
+function WorkflowMetaPanel() {
+  const { workflow, updateWorkflowMeta, setEntry, mode } = useEditorStore();
+  const readOnly = mode !== "design";
+  const [name, setName] = useState(workflow.name ?? "");
+  const [description, setDescription] = useState(workflow.description ?? "");
+  const nodeIds = Object.keys(workflow.nodes);
 
   return (
-    <div className="w-72 bg-white border-l border-gray-200 overflow-y-auto flex-shrink-0 p-4">
-      <h2 className="font-semibold text-gray-800 mb-3 text-sm">Recipe</h2>
+    <div className="w-96 bg-white border-l border-gray-200 overflow-y-auto flex-shrink-0 p-4">
+      <h2 className="font-semibold text-gray-800 mb-3 text-sm">Workflow</h2>
 
       <div className="mb-3">
         <label className="block text-xs font-medium text-gray-600 mb-1">ID</label>
-        <code className="text-xs text-gray-700 bg-gray-50 px-2 py-1 rounded block">{definition.id}</code>
+        <code className="text-xs text-gray-700 bg-gray-50 px-2 py-1 rounded block">{workflow.id}</code>
       </div>
 
       <div className="mb-3">
         <label className="block text-xs font-medium text-gray-600 mb-1">Name</label>
         <input
-          className="w-full border border-gray-300 rounded px-2 py-1 text-sm"
+          className={`w-full border border-gray-300 rounded px-2 py-1 text-sm ${readOnly ? "opacity-60 cursor-not-allowed bg-gray-50" : ""}`}
           value={name}
           onChange={(e) => setName(e.target.value)}
-          onBlur={() => updateRecipeMeta({ name })}
+          onBlur={() => updateWorkflowMeta({ name })}
+          disabled={readOnly}
         />
       </div>
 
       <div className="mb-3">
         <label className="block text-xs font-medium text-gray-600 mb-1">Description</label>
         <textarea
-          className="w-full border border-gray-300 rounded px-2 py-1 text-sm resize-none"
+          className={`w-full border border-gray-300 rounded px-2 py-1 text-sm resize-none ${readOnly ? "opacity-60 cursor-not-allowed bg-gray-50" : ""}`}
           rows={3}
           value={description}
           onChange={(e) => setDescription(e.target.value)}
-          onBlur={() => updateRecipeMeta({ description })}
+          onBlur={() => updateWorkflowMeta({ description })}
+          disabled={readOnly}
         />
       </div>
 
       <div className="mb-3">
-        <label className="block text-xs font-medium text-gray-600 mb-1">Version</label>
-        <input
-          className="w-full border border-gray-300 rounded px-2 py-1 text-sm"
-          value={version}
-          onChange={(e) => setVersion(e.target.value)}
-          onBlur={() => updateRecipeMeta({ version })}
-        />
-      </div>
-
-      <div className="mb-3">
-        <label className="block text-xs font-medium text-gray-600 mb-1">Initial state</label>
-        <code className="text-xs text-gray-700 bg-gray-50 px-2 py-1 rounded block">{definition.initial}</code>
-      </div>
-
-      <p className="text-xs text-gray-400 mt-4">Click a node or edge to edit it.</p>
-    </div>
-  );
-}
-
-// ─────────────────────────────────────────────
-// State panel
-// ─────────────────────────────────────────────
-
-import type { StateDefinition } from "@sweny-ai/engine";
-
-interface StatePanelProps {
-  id: string;
-  state: StateDefinition;
-  stateIds: string[];
-  isInitial: boolean;
-  updateState: (id: string, patch: Partial<StateDefinition>) => void;
-  setInitial: (id: string) => void;
-  deleteState: (id: string) => void;
-  addTransition: (sourceId: string, outcome: string, targetId: string) => void;
-  updateTransitionOutcome: (sourceId: string, oldOutcome: string, newOutcome: string) => void;
-  updateTransitionTarget: (sourceId: string, outcome: string, newTarget: string) => void;
-  deleteTransition: (sourceId: string, outcome: string) => void;
-}
-
-function StatePanel({
-  id,
-  state,
-  stateIds,
-  isInitial,
-  updateState,
-  setInitial,
-  deleteState,
-  addTransition,
-  updateTransitionOutcome,
-  updateTransitionTarget,
-  deleteTransition,
-}: StatePanelProps) {
-  const [newOutcome, setNewOutcome] = useState("");
-  const [newTarget, setNewTarget] = useState(stateIds[0] ?? "");
-  const [description, setDescription] = useState(state.description ?? "");
-
-  const targetOptions = [...stateIds, "end"];
-  const onEntries = Object.entries(state.on ?? {});
-
-  function handleAddTransition(e: React.FormEvent) {
-    e.preventDefault();
-    if (!newOutcome.trim() || !newTarget) return;
-    addTransition(id, newOutcome.trim(), newTarget);
-    setNewOutcome("");
-  }
-
-  return (
-    <div className="w-72 bg-white border-l border-gray-200 overflow-y-auto flex-shrink-0 p-4">
-      <h2 className="font-semibold text-gray-800 mb-3 text-sm">State</h2>
-
-      <div className="mb-3">
-        <label className="block text-xs font-medium text-gray-600 mb-1">ID</label>
-        <code className="text-xs text-gray-700 bg-gray-50 px-2 py-1 rounded block">{id}</code>
-      </div>
-
-      <div className="mb-3">
-        <label className="block text-xs font-medium text-gray-600 mb-1">Phase</label>
+        <label className="block text-xs font-medium text-gray-600 mb-1">Entry node</label>
         <select
-          className="w-full border border-gray-300 rounded px-2 py-1 text-sm"
-          value={state.phase}
-          onChange={(e) => updateState(id, { phase: e.target.value as WorkflowPhase })}
+          className={`w-full border border-gray-300 rounded px-2 py-1 text-sm ${readOnly ? "opacity-60 cursor-not-allowed bg-gray-50" : ""}`}
+          value={workflow.entry}
+          onChange={(e) => setEntry(e.target.value)}
+          disabled={readOnly}
         >
-          <option value="learn">learn</option>
-          <option value="act">act</option>
-          <option value="report">report</option>
-        </select>
-      </div>
-
-      <div className="mb-3">
-        <label className="flex items-center gap-2 text-xs font-medium text-gray-600">
-          <input
-            type="checkbox"
-            checked={state.critical ?? false}
-            onChange={(e) => updateState(id, { critical: e.target.checked })}
-          />
-          Critical
-        </label>
-      </div>
-
-      <div className="mb-3">
-        <label className="block text-xs font-medium text-gray-600 mb-1">Description</label>
-        <input
-          className="w-full border border-gray-300 rounded px-2 py-1 text-sm"
-          value={description}
-          onChange={(e) => setDescription(e.target.value)}
-          onBlur={() => updateState(id, { description })}
-        />
-      </div>
-
-      <div className="mb-3">
-        <label className="block text-xs font-medium text-gray-600 mb-1">Next (default)</label>
-        <select
-          className="w-full border border-gray-300 rounded px-2 py-1 text-sm"
-          value={state.next ?? ""}
-          onChange={(e) => {
-            const val = e.target.value;
-            updateState(id, { next: val === "" ? undefined : val });
-          }}
-        >
-          <option value="">(none)</option>
-          {targetOptions.map((s) => (
-            <option key={s} value={s}>
-              {s}
+          {nodeIds.map((id) => (
+            <option key={id} value={id}>
+              {id}
             </option>
           ))}
         </select>
       </div>
 
-      <div className="mb-3">
-        <label className="block text-xs font-medium text-gray-600 mb-2">Transitions (on)</label>
-        {onEntries.length === 0 && <p className="text-xs text-gray-400">No transitions.</p>}
-        {onEntries.map(([outcome, target]) => (
-          <TransitionRow
-            key={outcome}
-            sourceId={id}
-            outcome={outcome}
-            target={target}
-            targetOptions={targetOptions}
-            updateTransitionOutcome={updateTransitionOutcome}
-            updateTransitionTarget={updateTransitionTarget}
-            deleteTransition={deleteTransition}
-          />
-        ))}
-
-        {/* Add transition row */}
-        <form onSubmit={handleAddTransition} className="flex gap-1 mt-2">
-          <input
-            value={newOutcome}
-            onChange={(e) => setNewOutcome(e.target.value)}
-            placeholder="outcome"
-            className="flex-1 border border-gray-300 rounded px-2 py-1 text-xs min-w-0"
-          />
-          <select
-            value={newTarget}
-            onChange={(e) => setNewTarget(e.target.value)}
-            className="border border-gray-300 rounded px-1 py-1 text-xs"
-          >
-            {targetOptions.map((s) => (
-              <option key={s} value={s}>
-                {s}
-              </option>
-            ))}
-          </select>
-          <button type="submit" className="px-2 py-1 rounded bg-blue-600 text-white text-xs hover:bg-blue-500">
-            Add
-          </button>
-        </form>
-      </div>
-
-      {/* Danger zone */}
-      <div className="mt-4 pt-4 border-t border-gray-200 flex flex-col gap-2">
-        <button
-          onClick={() => setInitial(id)}
-          disabled={isInitial}
-          className="px-3 py-1 rounded text-xs bg-gray-100 hover:bg-gray-200 disabled:opacity-40 disabled:cursor-not-allowed"
-        >
-          {isInitial ? "Initial state" : "Set as initial"}
-        </button>
-        <button
-          onClick={() => deleteState(id)}
-          className="px-3 py-1 rounded text-xs bg-red-600 text-white hover:bg-red-500"
-        >
-          Delete state
-        </button>
-      </div>
+      <p className="text-xs text-gray-400 mt-4">
+        {readOnly ? "Read-only during execution." : "Click a node or edge to edit it."}
+      </p>
     </div>
   );
 }
 
-interface TransitionRowProps {
-  sourceId: string;
-  outcome: string;
-  target: string;
-  targetOptions: string[];
-  updateTransitionOutcome: (sourceId: string, oldOutcome: string, newOutcome: string) => void;
-  updateTransitionTarget: (sourceId: string, outcome: string, newTarget: string) => void;
-  deleteTransition: (sourceId: string, outcome: string) => void;
+// ─────────────────────────────────────────────
+// Node panel
+// ─────────────────────────────────────────────
+
+interface NodePanelProps {
+  id: string;
+  node: Node;
+  nodeIds: string[];
+  isEntry: boolean;
+  isUnreachable: boolean;
+  readOnly: boolean;
+  execResult?: NodeResult;
+  isRunning: boolean;
+  updateNode: (id: string, patch: Partial<Node>) => void;
+  renameNode: (oldId: string, newId: string) => string | null;
+  setEntry: (id: string) => void;
+  deleteNode: (id: string) => void;
 }
 
-function TransitionRow({
-  sourceId,
-  outcome,
-  target,
-  targetOptions,
-  updateTransitionOutcome,
-  updateTransitionTarget,
-  deleteTransition,
-}: TransitionRowProps) {
-  const [editOutcome, setEditOutcome] = useState(outcome);
+function NodePanel({
+  id,
+  node,
+  nodeIds,
+  isEntry,
+  isUnreachable,
+  readOnly,
+  execResult,
+  isRunning,
+  updateNode,
+  renameNode,
+  setEntry,
+  deleteNode,
+}: NodePanelProps) {
+  const [editId, setEditId] = useState(id);
+  const [idError, setIdError] = useState<string | null>(null);
+  const [name, setNodeName] = useState(node.name);
+
+  // Source type state — track kind + value separately
+  const [sourceKind, setSourceKind] = useState<"inline" | "file" | "url">(() => deriveSourceKind(node.instruction));
+  const [instruction, setInstruction] = useState(() => deriveInstructionValue(node.instruction));
+
+  // The panel is keyed by node `id`, so switching nodes remounts and re-seeds.
+  // But the *same* node's content can change underneath us without an id change
+  // (undo/redo via temporal, or an external rewrite). Re-seed local state when
+  // the node's committed values change. Guard against clobbering in-progress
+  // typing by tracking the last node values we synced from and only re-seeding
+  // when the incoming node value differs from that snapshot — typing only moves
+  // local state, not `node.*`, so it won't trip this.
+  const lastSyncedName = useRef(node.name);
+  const lastSyncedInstruction = useRef(node.instruction);
+  useEffect(() => {
+    if (node.name !== lastSyncedName.current) {
+      lastSyncedName.current = node.name;
+      setNodeName(node.name);
+    }
+    if (node.instruction !== lastSyncedInstruction.current) {
+      lastSyncedInstruction.current = node.instruction;
+      setSourceKind(deriveSourceKind(node.instruction));
+      setInstruction(deriveInstructionValue(node.instruction));
+      setEditId(id);
+      setIdError(null);
+    }
+  }, [node.name, node.instruction, id]);
+
+  const buildSource = useCallback((kind: "inline" | "file" | "url", value: string): Source => {
+    if (kind === "file") return { file: value };
+    if (kind === "url") return { url: value };
+    return value; // inline — plain string
+  }, []);
+
+  const [showExpanded, setShowExpanded] = useState(false);
+  const [aiLoading, setAiLoading] = useState(false);
+  const [aiError, setAiError] = useState<string | null>(null);
 
   return (
-    <div className="flex items-center gap-1 mb-1">
-      <input
-        className="flex-1 border border-gray-300 rounded px-1 py-0.5 text-xs min-w-0"
-        value={editOutcome}
-        onChange={(e) => setEditOutcome(e.target.value)}
-        onBlur={() => {
-          const trimmed = editOutcome.trim();
-          if (trimmed && trimmed !== outcome) {
-            updateTransitionOutcome(sourceId, outcome, trimmed);
-          }
-        }}
-      />
-      <span className="text-gray-400 text-xs">→</span>
-      <select
-        className="border border-gray-300 rounded px-1 py-0.5 text-xs"
-        value={target}
-        onChange={(e) => updateTransitionTarget(sourceId, outcome, e.target.value)}
-      >
-        {targetOptions.map((s) => (
-          <option key={s} value={s}>
-            {s}
-          </option>
-        ))}
-      </select>
-      <button
-        onClick={() => deleteTransition(sourceId, outcome)}
-        className="text-red-500 hover:text-red-700 text-xs px-1"
-        title="Delete transition"
-      >
-        ×
-      </button>
+    <div className="w-96 bg-white border-l border-gray-200 overflow-y-auto flex-shrink-0 p-4">
+      <h2 className="font-semibold text-gray-800 mb-3 text-sm">Node</h2>
+
+      {/* Unreachable warning */}
+      {isUnreachable && !readOnly && (
+        <div className="bg-orange-50 border border-orange-200 rounded p-2 text-xs text-orange-700 mb-2">
+          This node is unreachable from the entry node. Add an edge pointing to it.
+        </div>
+      )}
+
+      {/* Execution result card */}
+      {readOnly && <ExecutionResultCard result={execResult} isRunning={isRunning} />}
+
+      <div className="mb-3">
+        <label className="block text-xs font-medium text-gray-600 mb-1">ID</label>
+        <input
+          className={`w-full border rounded px-2 py-1 text-sm font-mono ${idError ? "border-red-400" : "border-gray-300"} ${readOnly ? "opacity-60 cursor-not-allowed bg-gray-50" : ""}`}
+          value={editId}
+          disabled={readOnly}
+          onChange={(e) => {
+            setEditId(e.target.value);
+            setIdError(null);
+          }}
+          onBlur={() => {
+            const trimmed = editId.trim();
+            if (trimmed === id) return;
+            const err = renameNode(id, trimmed);
+            if (err) {
+              setIdError(err);
+              setEditId(id);
+            } else {
+              setIdError(null);
+            }
+          }}
+        />
+        {idError && <p className="text-xs text-red-500 mt-0.5">{idError}</p>}
+      </div>
+
+      <div className="mb-3">
+        <label className="block text-xs font-medium text-gray-600 mb-1">Name</label>
+        <input
+          className={`w-full border border-gray-300 rounded px-2 py-1 text-sm ${readOnly ? "opacity-60 cursor-not-allowed bg-gray-50" : ""}`}
+          value={name}
+          disabled={readOnly}
+          onChange={(e) => setNodeName(e.target.value)}
+          onBlur={() => updateNode(id, { name })}
+        />
+      </div>
+
+      <div className="mb-3 flex-1 flex flex-col min-h-0">
+        <div className="flex items-center justify-between mb-1">
+          <label className="text-xs font-medium text-gray-600">Instruction</label>
+          <div className="flex items-center gap-2">
+            {!readOnly && (
+              <select
+                className="text-[10px] border border-gray-300 rounded px-1.5 py-0.5 text-gray-600 bg-white"
+                value={sourceKind}
+                onChange={(e) => {
+                  const newKind = e.target.value as "inline" | "file" | "url";
+                  if (newKind === sourceKind) return;
+                  setSourceKind(newKind);
+                  setInstruction("");
+                  updateNode(id, { instruction: buildSource(newKind, "") });
+                }}
+              >
+                <option value="inline">Inline</option>
+                <option value="file">File</option>
+                <option value="url">URL</option>
+              </select>
+            )}
+            {!readOnly && sourceKind === "inline" && (
+              <button
+                onClick={() => setShowExpanded(true)}
+                className="text-gray-400 hover:text-blue-500 transition-colors"
+                title="Expand editor"
+              >
+                <svg width="14" height="14" viewBox="0 0 16 16" fill="none">
+                  <path
+                    d="M2 10v4h4M14 6V2h-4M2 14L6.5 9.5M14 2L9.5 6.5"
+                    stroke="currentColor"
+                    strokeWidth="1.5"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                  />
+                </svg>
+              </button>
+            )}
+          </div>
+        </div>
+
+        {sourceKind === "inline" ? (
+          <textarea
+            className={`w-full border border-gray-300 rounded px-2 py-1 text-sm resize-y font-mono flex-1 ${readOnly ? "opacity-60 cursor-not-allowed bg-gray-50" : ""}`}
+            rows={14}
+            value={instruction}
+            disabled={readOnly}
+            onChange={(e) => setInstruction(e.target.value)}
+            onBlur={() => updateNode(id, { instruction: buildSource(sourceKind, instruction) })}
+            placeholder="What should the AI model do at this node?"
+          />
+        ) : (
+          <div>
+            <input
+              className={`w-full border border-gray-300 rounded px-2 py-1 text-sm font-mono ${readOnly ? "opacity-60 cursor-not-allowed bg-gray-50" : ""}`}
+              value={instruction}
+              disabled={readOnly}
+              onChange={(e) => setInstruction(e.target.value)}
+              onBlur={() => updateNode(id, { instruction: buildSource(sourceKind, instruction) })}
+              placeholder={sourceKind === "file" ? "./path/to/instruction.md" : "https://example.com/instruction.md"}
+            />
+            <p className="text-xs text-gray-400 mt-1">
+              {sourceKind === "file"
+                ? "Relative or absolute path — resolved at execution time"
+                : "HTTP(S) URL — fetched at execution time"}
+            </p>
+          </div>
+        )}
+
+        {!readOnly && sourceKind === "inline" && import.meta.env.DEV && (
+          <div className="mt-2 flex items-center gap-2">
+            <button
+              disabled={aiLoading}
+              onClick={async () => {
+                setAiLoading(true);
+                setAiError(null);
+                try {
+                  const { workflow } = useEditorStore.getState();
+                  const text = await generateInstruction({
+                    nodeName: name,
+                    nodeId: id,
+                    skills: node.skills,
+                    existingInstruction: instruction,
+                    workflowContext: {
+                      workflowName: workflow.name,
+                      workflowDescription: workflow.description,
+                      nodeNames: Object.keys(workflow.nodes),
+                    },
+                  });
+                  setInstruction(text);
+                  updateNode(id, { instruction: text });
+                } catch (err) {
+                  setAiError(err instanceof Error ? err.message : "Generation failed");
+                } finally {
+                  setAiLoading(false);
+                }
+              }}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium bg-blue-50 text-blue-600 hover:bg-blue-100 border border-blue-200 disabled:opacity-40 transition-colors"
+            >
+              <svg width="12" height="12" viewBox="0 0 16 16" fill="currentColor">
+                <path d="M8 1l1.5 4.5L14 7l-4.5 1.5L8 13l-1.5-4.5L2 7l4.5-1.5z" />
+              </svg>
+              {aiLoading ? "Generating..." : instruction.trim() ? "Improve with AI" : "Generate with AI"}
+            </button>
+            {aiError && <span className="text-[9px] text-red-500">{aiError}</span>}
+          </div>
+        )}
+      </div>
+
+      {showExpanded && (
+        <InstructionEditor
+          nodeId={id}
+          nodeName={name}
+          instruction={instruction}
+          skills={node.skills}
+          onSave={(text) => {
+            setInstruction(text);
+            updateNode(id, { instruction: buildSource(sourceKind, text) });
+          }}
+          onClose={() => setShowExpanded(false)}
+        />
+      )}
+
+      {/* Skills toggle list */}
+      <div className="mb-3">
+        <label className="block text-xs font-medium text-gray-600 mb-2">Skills</label>
+        <div className="flex flex-col gap-1 max-h-48 overflow-y-auto">
+          {skillCatalog.map((skill) => {
+            const active = node.skills.includes(skill.id);
+            return (
+              <label
+                key={skill.id}
+                className={`flex items-center gap-2 text-xs p-1.5 rounded ${active ? "bg-blue-50" : "hover:bg-gray-50"} ${readOnly ? "opacity-60" : "cursor-pointer"}`}
+              >
+                <input
+                  type="checkbox"
+                  checked={active}
+                  disabled={readOnly}
+                  onChange={() => {
+                    const newSkills = active ? node.skills.filter((s) => s !== skill.id) : [...node.skills, skill.id];
+                    updateNode(id, { skills: newSkills });
+                  }}
+                />
+                <SkillIcon skillId={skill.id} size={14} />
+                <span className="font-medium text-gray-700">{skill.name}</span>
+                <span className="text-gray-400 ml-auto">{skill.tools.length} tools</span>
+              </label>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* Actions */}
+      {!readOnly && (
+        <div className="mt-4 pt-4 border-t border-gray-200 flex flex-col gap-2">
+          <button
+            onClick={() => setEntry(id)}
+            disabled={isEntry}
+            className="px-3 py-1 rounded text-xs bg-gray-100 hover:bg-gray-200 disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            {isEntry ? "Entry node" : "Set as entry"}
+          </button>
+          <button
+            onClick={() => deleteNode(id)}
+            className="px-3 py-1 rounded text-xs bg-red-600 text-white hover:bg-red-500"
+          >
+            Delete node
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────
+// Execution result card
+// ─────────────────────────────────────────────
+
+interface ExecutionResultCardProps {
+  result?: NodeResult;
+  isRunning: boolean;
+}
+
+function ExecutionResultCard({ result, isRunning }: ExecutionResultCardProps) {
+  const [expanded, setExpanded] = useState(false);
+
+  if (isRunning) {
+    return (
+      <div className="mb-3 p-2 rounded bg-blue-50 border border-blue-200 text-xs animate-pulse">
+        <span className="text-blue-600 font-medium">running...</span>
+      </div>
+    );
+  }
+
+  if (!result) {
+    return <div className="mb-3 p-2 rounded bg-gray-50 border border-gray-200 text-xs text-gray-400">pending</div>;
+  }
+
+  const statusColor =
+    result.status === "success"
+      ? "text-green-700 bg-green-50 border-green-200"
+      : result.status === "failed"
+        ? "text-red-700 bg-red-50 border-red-200"
+        : "text-gray-600 bg-gray-50 border-gray-200";
+
+  const icon = result.status === "success" ? "ok" : result.status === "failed" ? "fail" : "skip";
+  const hasData = Object.keys(result.data ?? {}).length > 0;
+  const dataJson = hasData ? JSON.stringify(result.data, null, 2) : null;
+
+  return (
+    <div className={`mb-3 p-2 rounded border text-xs ${statusColor}`}>
+      <div className="flex items-center gap-1.5 font-medium">
+        <span>{icon}</span>
+        <span>{result.status}</span>
+      </div>
+      {result.toolCalls.length > 0 && (
+        <p className="mt-1 text-[10px] opacity-80">{result.toolCalls.length} tool calls</p>
+      )}
+      {hasData && (
+        <div className="mt-1">
+          <button onClick={() => setExpanded((v) => !v)} className="text-[10px] underline opacity-70 hover:opacity-100">
+            {expanded ? "Hide data" : "Show data"}
+          </button>
+          {expanded && (
+            <pre className="mt-1 text-[10px] bg-white/60 rounded p-1 overflow-auto max-h-32 whitespace-pre-wrap">
+              {dataJson!.length > 800 ? dataJson!.slice(0, 800) + "..." : dataJson}
+            </pre>
+          )}
+        </div>
+      )}
     </div>
   );
 }
@@ -371,74 +547,101 @@ function TransitionRow({
 // ─────────────────────────────────────────────
 
 interface EdgePanelProps {
-  source: string;
-  outcome: string;
-  currentTarget: string;
-  stateIds: string[];
-  updateTransitionOutcome: (sourceId: string, oldOutcome: string, newOutcome: string) => void;
-  updateTransitionTarget: (sourceId: string, outcome: string, newTarget: string) => void;
-  deleteTransition: (sourceId: string, outcome: string) => void;
+  edgeIndex: number;
+  from: string;
+  to: string;
+  when: string;
+  maxIterations?: number;
+  nodeIds: string[];
+  readOnly: boolean;
+  updateEdge: (edgeIndex: number, patch: { when?: string; to?: string; max_iterations?: number }) => void;
+  deleteEdge: (edgeIndex: number) => void;
 }
 
 function EdgePanel({
-  source,
-  outcome,
-  currentTarget,
-  stateIds,
-  updateTransitionOutcome,
-  updateTransitionTarget,
-  deleteTransition,
+  edgeIndex,
+  from,
+  to,
+  when,
+  maxIterations,
+  nodeIds,
+  readOnly,
+  updateEdge,
+  deleteEdge,
 }: EdgePanelProps) {
-  const [editOutcome, setEditOutcome] = useState(outcome);
-  const targetOptions = [...stateIds, "end"];
+  const [editWhen, setEditWhen] = useState(when);
+  const [editMaxIter, setEditMaxIter] = useState(maxIterations?.toString() ?? "");
 
   return (
-    <div className="w-72 bg-white border-l border-gray-200 overflow-y-auto flex-shrink-0 p-4">
-      <h2 className="font-semibold text-gray-800 mb-3 text-sm">Transition</h2>
+    <div className="w-96 bg-white border-l border-gray-200 overflow-y-auto flex-shrink-0 p-4">
+      <h2 className="font-semibold text-gray-800 mb-3 text-sm">Edge</h2>
 
       <div className="mb-3">
-        <label className="block text-xs font-medium text-gray-600 mb-1">Source</label>
-        <code className="text-xs text-gray-700 bg-gray-50 px-2 py-1 rounded block">{source}</code>
+        <label className="block text-xs font-medium text-gray-600 mb-1">From</label>
+        <code className="text-xs text-gray-700 bg-gray-50 px-2 py-1 rounded block">{from}</code>
       </div>
 
       <div className="mb-3">
-        <label className="block text-xs font-medium text-gray-600 mb-1">Outcome</label>
-        <input
-          className="w-full border border-gray-300 rounded px-2 py-1 text-sm"
-          value={editOutcome}
-          onChange={(e) => setEditOutcome(e.target.value)}
-          onBlur={() => {
-            const trimmed = editOutcome.trim();
-            if (trimmed && trimmed !== outcome) {
-              updateTransitionOutcome(source, outcome, trimmed);
-            }
-          }}
-        />
-      </div>
-
-      <div className="mb-3">
-        <label className="block text-xs font-medium text-gray-600 mb-1">Target</label>
+        <label className="block text-xs font-medium text-gray-600 mb-1">To</label>
         <select
-          className="w-full border border-gray-300 rounded px-2 py-1 text-sm"
-          value={currentTarget}
-          onChange={(e) => updateTransitionTarget(source, outcome, e.target.value)}
+          className={`w-full border border-gray-300 rounded px-2 py-1 text-sm ${readOnly ? "opacity-60 cursor-not-allowed bg-gray-50" : ""}`}
+          value={to}
+          onChange={(e) => updateEdge(edgeIndex, { to: e.target.value })}
+          disabled={readOnly}
         >
-          {targetOptions.map((s) => (
-            <option key={s} value={s}>
-              {s}
+          {nodeIds.map((id) => (
+            <option key={id} value={id}>
+              {id}
             </option>
           ))}
         </select>
       </div>
 
-      <div className="mt-4 pt-4 border-t border-gray-200">
-        <button
-          onClick={() => deleteTransition(source, outcome)}
-          className="w-full px-3 py-1 rounded text-xs bg-red-600 text-white hover:bg-red-500"
-        >
-          Delete transition
-        </button>
+      <div className="mb-3">
+        <label className="block text-xs font-medium text-gray-600 mb-1">Condition (when)</label>
+        <textarea
+          className={`w-full border border-gray-300 rounded px-2 py-1 text-sm resize-none ${readOnly ? "opacity-60 cursor-not-allowed bg-gray-50" : ""}`}
+          rows={3}
+          value={editWhen}
+          onChange={(e) => setEditWhen(e.target.value)}
+          onBlur={() => updateEdge(edgeIndex, { when: editWhen })}
+          disabled={readOnly}
+          placeholder="Leave empty for unconditional edge"
+        />
+        <p className="text-xs text-gray-400 mt-1">Natural language condition — Claude evaluates at runtime</p>
       </div>
+
+      <div className="mb-3">
+        <label className="block text-xs font-medium text-gray-600 mb-1">Max iterations</label>
+        <input
+          type="number"
+          min="0"
+          step="1"
+          className={`w-full border border-gray-300 rounded px-2 py-1 text-sm ${readOnly ? "opacity-60 cursor-not-allowed bg-gray-50" : ""}`}
+          value={editMaxIter}
+          onChange={(e) => setEditMaxIter(e.target.value)}
+          onBlur={() => {
+            const n = parseInt(editMaxIter, 10);
+            updateEdge(edgeIndex, { max_iterations: isNaN(n) ? 0 : n });
+          }}
+          disabled={readOnly}
+          placeholder="Unlimited"
+        />
+        <p className="text-xs text-gray-400 mt-1">
+          Limits how many times this edge can be followed in retry loops. Leave empty for unlimited.
+        </p>
+      </div>
+
+      {!readOnly && (
+        <div className="mt-4 pt-4 border-t border-gray-200">
+          <button
+            onClick={() => deleteEdge(edgeIndex)}
+            className="w-full px-3 py-1 rounded text-xs bg-red-600 text-white hover:bg-red-500"
+          >
+            Delete edge
+          </button>
+        </div>
+      )}
     </div>
   );
 }
@@ -449,8 +652,8 @@ function EdgePanel({
 
 function EmptyPanel() {
   return (
-    <div className="w-72 bg-white border-l border-gray-200 overflow-y-auto flex-shrink-0 p-4">
-      <p className="text-xs text-gray-400">State not found.</p>
+    <div className="w-96 bg-white border-l border-gray-200 overflow-y-auto flex-shrink-0 p-4">
+      <p className="text-xs text-gray-400">Node not found.</p>
     </div>
   );
 }

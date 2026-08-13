@@ -1,640 +1,201 @@
-<h1 align="center">SWEny</h1>
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-lockup-light.svg" />
+    <source media="(prefers-color-scheme: light)" srcset="assets/logo-lockup-dark.svg" />
+    <img src="assets/logo-lockup-dark.svg" alt="SWEny" width="280" />
+  </picture>
+</p>
 
 <p align="center">
-  <strong>Build AI-powered engineering workflows that learn from any source, take any action, and report through any channel.</strong>
+  <strong>AI workflows as code. Describe what you want, get a reliable DAG.</strong>
 </p>
 
 <p align="center">
   <a href="https://github.com/swenyai/sweny/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/swenyai/sweny/ci.yml?style=flat-square&label=CI" /></a>
-  <a href="https://www.npmjs.com/package/@sweny-ai/providers"><img alt="npm" src="https://img.shields.io/npm/v/@sweny-ai/providers?style=flat-square&color=orange" /></a>
-  <a href="https://github.com/swenyai/sweny/releases"><img alt="Release" src="https://img.shields.io/github/v/release/swenyai/sweny?style=flat-square&color=orange" /></a>
+  <a href="https://www.npmjs.com/package/@sweny-ai/core"><img alt="npm" src="https://img.shields.io/npm/v/@sweny-ai/core?style=flat-square&color=orange" /></a>
   <a href="https://github.com/swenyai/sweny/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/github/license/swenyai/sweny?style=flat-square" /></a>
-  <a href="https://sweny.ai"><img alt="Website" src="https://img.shields.io/badge/sweny.ai-website-blue?style=flat-square" /></a>
-  <a href="https://github.com/marketplace/actions/sweny-ai"><img alt="Marketplace" src="https://img.shields.io/badge/GitHub%20Marketplace-SWEny%20AI-orange?style=flat-square&logo=github" /></a>
+  <a href="https://docs.sweny.ai"><img alt="Docs" src="https://img.shields.io/badge/docs-docs.sweny.ai-blue?style=flat-square" /></a>
+  <a href="https://marketplace.sweny.ai"><img alt="Marketplace" src="https://img.shields.io/badge/Workflows-marketplace.sweny.ai-blueviolet?style=flat-square" /></a>
 </p>
 
 ---
 
-This monorepo contains the SWEny platform:
+## Quickstart
+
+```bash
+npx @sweny-ai/core new      # pick a workflow → auto-detects providers → done
+sweny workflow run .sweny/workflows/pr-review.yml
+```
+
+Or if you already have `@sweny-ai/core` installed:
+
+```bash
+sweny new
+```
+
+Already have a `.sweny.yml`? `sweny new` adds additional workflows non-destructively.
+
+Build a workflow from scratch — pick "Describe your own" in the `sweny new` picker, or:
+
+```bash
+sweny workflow create "review PRs for security issues and code quality"
+sweny workflow run .sweny/workflows/pr-review.yml
+
+# Visualize any workflow as a Mermaid diagram — drop it into a PR or README
+sweny workflow diagram .sweny/workflows/pr-review.yml -o pr-review.mmd
+```
+
+Keep the CLI current:
+
+```bash
+sweny upgrade          # pulls the latest @sweny-ai/core via your package manager
+sweny upgrade --check  # dry-run: just report the available version
+```
+
+Browse **[marketplace.sweny.ai](https://marketplace.sweny.ai)** for ready-to-run workflows.
+
+## What it does
+
+Describe a task in plain English. SWEny builds a DAG of focused AI agents — each node gets its own MCP tool set scoped by the skills it declares, structured output, and conditional routing. Every tool call is tracked. (The underlying Claude Code agent process keeps its built-in tools available so nodes stay agentic inside their box; see [ARCHITECTURE.md](./ARCHITECTURE.md#what-scoped-tools-means) for the exact capability contract.)
+
+```
+$ sweny workflow create "audit our repo for security issues, \
+    scan dependencies, and create Linear tickets for anything critical"
+
+  GitHub Security Audit
+
+  o Scan Recent Commits for Exposed Secrets
+  |
+  +---> o Review Open PRs for Security Changes
+  +---> o Scan Dependencies for Vulnerabilities
+       |
+  o Compile Security Posture Report
+  |
+  o Create Linear Tickets for Critical Findings
+
+  Save to .sweny/workflows/github_security_audit.yml? [Y/n/refine]
+```
+
+## Use it anywhere
+
+| Surface | What it does |
+|---------|-------------|
+| **[CLI](https://docs.sweny.ai/cli/)** | Build, run, and publish workflows from your terminal |
+| **[GitHub Action](https://docs.sweny.ai/action/)** | Run any workflow on CI — plus dedicated [triage](https://github.com/swenyai/triage) and [e2e](https://github.com/swenyai/e2e) actions |
+| **[Studio](https://docs.sweny.ai/studio/)** | Visual DAG editor and live execution monitor |
+| **[Claude Code Plugin](https://docs.sweny.ai/advanced/mcp-plugin/)** | Slash commands, MCP tools, and an isolated workflow agent |
+| **[Marketplace](https://marketplace.sweny.ai)** | Browse, fork, and share community workflows |
+
+## Custom skills
+
+Extend any workflow with your own skills. Scaffold one in a single command:
+
+```bash
+sweny skill new code-standards -d "Team TypeScript conventions"
+sweny skill list
+```
+
+Or write the file by hand at `.sweny/skills/code-standards/SKILL.md`:
+
+```
+.sweny/skills/code-standards/SKILL.md
+```
+
+```markdown
+---
+name: code-standards
+description: Team coding conventions for TypeScript
+---
+
+When reviewing TypeScript code:
+- Use camelCase for variables and functions
+- Every public function needs at least one test
+- Mock at boundaries (HTTP, DB), not internal functions
+```
+
+Then reference it in any workflow node:
+
+```yaml
+nodes:
+  review:
+    name: Code Review
+    instruction: Review the pull request.
+    skills: [code-standards, github]
+```
+
+Skills are cross-tool compatible — the same `SKILL.md` works in Claude Code, Codex, and Gemini CLI. Write once, use everywhere. [Learn more](https://docs.sweny.ai/skills/custom/).
+
+## Built-in skills
+
+Set the credential, the skill is ready. No configuration.
+
+| Skill | What it does |
+|-------|-------------|
+| **github** | Search code, read files, create issues, open PRs |
+| **linear** | Create, search, and update issues |
+| **sentry** | Query errors, issues, and stack traces |
+| **datadog** | Query logs, metrics, and monitors |
+| **betterstack** | Query incidents, monitors, and logs |
+| **slack** | Send messages via webhook or bot API |
+| **notification** | Discord, Teams, email, generic webhooks |
+
+## GitHub Actions
+
+```yaml
+# Run any workflow on CI
+- uses: swenyai/sweny@v5
+  with:
+    workflow: .sweny/workflows/security-audit.yml
+    claude-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+  env:
+    LINEAR_API_KEY: ${{ secrets.LINEAR_API_KEY }}
+```
+
+Focused actions for common use cases:
+
+| Action | Purpose |
+|--------|---------|
+| [`swenyai/sweny@v5`](https://github.com/swenyai/sweny) | Run any workflow YAML |
+| [`swenyai/triage@v1`](https://github.com/swenyai/triage) | SRE triage — observability + issue tracker |
+| [`swenyai/e2e@v1`](https://github.com/swenyai/e2e) | Agentic E2E browser tests |
+
+### Run reporting (optional, not yet available)
+
+SWEny runs locally or in CI with **zero phone-home behavior**. No anonymous telemetry, no pings, nothing.
+
+The CLI contains an opt-in run reporting path, gated entirely on a `SWENY_CLOUD_TOKEN` project token. Unless you set that variable yourself, every reporting entry point returns before making a request, so a default install sends nothing.
+
+The hosted service behind it is in active development and **not open for sign-ups**, so there is no token to obtain today. See [PRIVACY.md](./PRIVACY.md) for the exact payload if you point it at your own endpoint.
+
+## Publish to the marketplace
+
+Share your workflows and skills with the community:
+
+```bash
+sweny publish   # interactive CLI — publish a workflow or skill
+```
+
+## Packages
 
 | Package | Description |
 |---------|-------------|
-| **[@sweny-ai/engine](packages/engine)** | Recipe engine — DAG runner, built-in triage and implement recipes |
-| **[@sweny-ai/cli](packages/cli)** | CLI — run triage and implement from your terminal |
-| **[SWEny Triage](#sweny-triage)** | GitHub Action — autonomous SRE triage |
-| **[@sweny-ai/providers](packages/providers)** | 30+ provider implementations |
-| **[@sweny-ai/agent](packages/agent)** | AI assistant — Slack bot + CLI |
-| **[@sweny-ai/studio](packages/studio)** | Visual recipe editor and execution monitor |
-| **[@sweny-ai/web](packages/web)** | sweny.ai website |
-
----
-
-## How It Works
-
-SWEny workflows follow three phases:
-
-- **Learn** -- Connect any input source (observability logs, issue trackers, APIs) to gather context about your system.
-- **Act** -- Take any action (create tickets, open PRs, dispatch workflows) based on AI-driven analysis.
-- **Report** -- Notify through any channel (Slack, email, GitHub, Discord, Teams, webhooks) with full investigation details.
-
-```
-┌─────────────────────────────────────────────┐
-│  Entry Points                               │
-│  GitHub Action · Slack Bot · CLI · Cloud     │
-├─────────────────────────────────────────────┤
-│  @sweny-ai/engine                              │
-│  Recipe Runner · DAG Executor · Step Context │
-├─────────────────────────────────────────────┤
-│  @sweny-ai/providers                           │
-│  Observability · Issue Tracking · Source     │
-│  Control · Notification · Coding Agent      │
-└─────────────────────────────────────────────┘
-```
-
-Entry points (GitHub Action, Slack Bot, CLI) feed into the **@sweny-ai/engine**, which orchestrates recipes -- pre-built workflows composed of Learn, Act, and Report steps. Each step delegates to a pluggable provider from **@sweny-ai/providers**, so you can swap Datadog for CloudWatch or Linear for Jira without changing your workflow.
-
----
-
-## SWEny Triage
-
-**SWEny Triage is the first recipe built on the engine** -- autonomous SRE triage that monitors your observability logs, investigates issues with Claude AI, creates tickets, and opens fix PRs, all without human intervention.
-
-Instead of waking up to a wall of alerts, SWEny Triage analyzes your logs overnight, identifies the highest-impact issue, creates a ticket with full root cause analysis, implements a fix, and opens a PR ready for review by morning.
-
-### Quick Start
-
-**Step 1: Try it out (dry run, 3 secrets)**
-
-Create `.github/workflows/sweny-triage.yml`:
-
-```yaml
-name: SWEny Triage
-on:
-  workflow_dispatch:  # Manual trigger to start
-
-permissions:
-  contents: read
-  issues: write
-
-jobs:
-  triage:
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - uses: swenyai/sweny@v1
-        with:
-          claude-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          dd-api-key: ${{ secrets.DD_API_KEY }}
-          dd-app-key: ${{ secrets.DD_APP_KEY }}
-          dry-run: true
-```
-
-That's it — 3 secrets and you'll see a full investigation report in the GitHub Actions summary. No PRs, no tickets, just analysis.
-
-> **Why `claude-oauth-token`?** This uses your Claude Max subscription — predictable monthly cost, no per-token billing surprises. If you prefer pay-per-use, swap it for `anthropic-api-key` with an [Anthropic API key](https://console.anthropic.com/).
-
-**Step 2: Turn it on**
-
-Once you're happy with the investigation quality, remove `dry-run`, add write permissions, and schedule it:
-
-```yaml
-name: SWEny Triage
-on:
-  schedule:
-    - cron: '0 6 * * 1,4'  # Mon & Thu at 6 AM UTC
-  workflow_dispatch:
-
-permissions:
-  contents: write
-  pull-requests: write
-  issues: write
-
-jobs:
-  triage:
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - uses: swenyai/sweny@v1
-        with:
-          claude-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-          dd-api-key: ${{ secrets.DD_API_KEY }}
-          dd-app-key: ${{ secrets.DD_APP_KEY }}
-```
-
-SWEny creates GitHub Issues by default — zero additional config. Want Linear or Jira instead? See [Issue Tracker](#issue-tracker) below.
-
-### How It Works
-
-```
-                    ┌─────────────────────┐
-                    │   Schedule / Manual  │
-                    │      Trigger         │
-                    └──────────┬──────────┘
-                               │
-                    ┌──────────▼──────────┐
-                    │  Learn               │
-                    │                      │
-                    │  • Query logs        │
-                    │  • Analyze errors    │
-                    │  • Check tracker for │
-                    │    known issues      │
-                    │  • Rank by impact    │
-                    └──────────┬──────────┘
-                               │
-                  ┌────────────┼────────────┐
-                  │            │            │
-            ┌─────▼────┐ ┌────▼─────┐ ┌────▼─────┐
-            │  skip     │ │ +1       │ │implement │
-            │           │ │ existing │ │          │
-            │  No novel │ │          │ │  Novel   │
-            │  issues   │ │ Add      │ │  issue   │
-            └───────────┘ │ occurrence│ └────┬─────┘
-                          └──────────┘      │
-                                 ┌──────────▼──────────┐
-                                 │  Act                 │
-                                 │                      │
-                                 │  • Create/find issue │
-                                 │  • Create branch     │
-                                 │  • Claude writes fix │
-                                 │  • Open PR           │
-                                 │  • Link to tracker   │
-                                 └──────────┬───────────┘
-                                            │
-                                 ┌──────────▼──────────┐
-                                 │  Report              │
-                                 │                      │
-                                 │  • GitHub Summary    │
-                                 │  • Investigation log │
-                                 │  • Issue report      │
-                                 └──────────────────────┘
-```
-
-**Novelty gate** — SWEny won't create duplicate tickets. It checks your issue tracker for existing issues before acting, and adds "+1 occurrence" comments to known issues instead.
-
-**Cross-repo dispatch** — If the bug belongs to a different repository (determined via your service map), SWEny automatically dispatches the fix to the correct repo.
-
-### Inputs
-
-#### Recipe
-
-| Input | Description | Default |
-|-------|-------------|---------|
-| `recipe` | Recipe to run (`triage`, `implement`) | `triage` |
-
-#### Authentication
-
-| Input | Description | Required |
-|-------|-------------|----------|
-| `claude-oauth-token` | Claude Code OAuth token (Max subscription) — predictable cost | Recommended |
-| `anthropic-api-key` | Anthropic API key (pay-per-use) | Alternative |
-
-> Use `claude-oauth-token` with a Claude Max subscription for predictable monthly costs. Set it as a repository secret named `CLAUDE_CODE_OAUTH_TOKEN`. The `anthropic-api-key` option is available if you prefer direct API billing.
-
-#### Coding Agent
-
-| Input | Description | Default |
-|-------|-------------|---------|
-| `coding-agent-provider` | Coding agent to use for implementation (`claude`, `codex`, `gemini`) | `claude` |
-| `openai-api-key` | OpenAI API key (required when `coding-agent-provider` is `codex`) | — |
-| `gemini-api-key` | Google Gemini API key (required when `coding-agent-provider` is `gemini`) | — |
-
-#### Observability Provider
-
-| Input | Description | Default |
-|-------|-------------|---------|
-| `observability-provider` | Provider to use (`datadog`, `sentry`, `cloudwatch`, `splunk`, `elastic`, `newrelic`, `loki`, `file`) | `datadog` |
-| **Datadog** | | |
-| `dd-api-key` | Datadog API key | — |
-| `dd-app-key` | Datadog Application key | — |
-| `dd-site` | Datadog site | `datadoghq.com` |
-| **Sentry** | | |
-| `sentry-auth-token` | Sentry auth token | — |
-| `sentry-org` | Sentry organization slug | — |
-| `sentry-project` | Sentry project slug | — |
-| `sentry-base-url` | Sentry base URL | `https://sentry.io` |
-| **CloudWatch** | | |
-| `cloudwatch-region` | AWS region | `us-east-1` |
-| `cloudwatch-log-group-prefix` | Log group prefix to scan | — |
-| **Splunk** | | |
-| `splunk-url` | Splunk instance URL | — |
-| `splunk-token` | Splunk HEC token | — |
-| `splunk-index` | Splunk index to query | `main` |
-| **Elasticsearch** | | |
-| `elastic-url` | Elasticsearch URL | — |
-| `elastic-api-key` | Elasticsearch API key | — |
-| `elastic-index` | Elasticsearch index pattern | `logs-*` |
-| **New Relic** | | |
-| `newrelic-api-key` | New Relic API key | — |
-| `newrelic-account-id` | New Relic account ID | — |
-| `newrelic-region` | New Relic region (`us` or `eu`) | `us` |
-| **Grafana Loki** | | |
-| `loki-url` | Loki endpoint URL | — |
-| `loki-api-key` | Loki API key | — |
-| `loki-org-id` | Loki tenant/org ID | — |
-| **File** | | |
-| `log-file-path` | Path to a local JSON log file (required when `observability-provider` is `file`) | — |
-
-#### Issue Tracker
-
-| Input | Description | Default |
-|-------|-------------|---------|
-| `issue-tracker-provider` | Provider to use | `github-issues` |
-| **Linear** | | |
-| `linear-api-key` | Linear API key | — |
-| `linear-team-id` | Linear team UUID | — |
-| `linear-bug-label-id` | Label UUID for bugs | — |
-| `linear-triage-label-id` | Label UUID for agent-triage | — |
-| `linear-state-backlog` | State UUID for Backlog | — |
-| `linear-state-in-progress` | State UUID for In Progress | — |
-| `linear-state-peer-review` | State UUID for Peer Review | — |
-| **Jira** | | |
-| `jira-base-url` | Jira instance URL | — |
-| `jira-email` | Jira account email | — |
-| `jira-api-token` | Jira API token | — |
-| **GitHub Issues** | | |
-| Uses existing `github-token` | | |
-
-#### Source Control
-
-| Input | Description | Default |
-|-------|-------------|---------|
-| `source-control-provider` | Provider to use | `github` |
-| `gitlab-token` | GitLab personal access token | — |
-| `gitlab-project-id` | GitLab project ID | — |
-| `gitlab-base-url` | GitLab base URL | `https://gitlab.com` |
-
-#### Investigation
-
-| Input | Description | Default |
-|-------|-------------|---------|
-| `time-range` | Time window to analyze (`1h`, `6h`, `24h`, `7d`) | `24h` |
-| `severity-focus` | What to look for (`errors`, `warnings`, `all`) | `errors` |
-| `service-filter` | Service pattern (`my-svc`, `api-*`, `*`) | `*` |
-| `investigation-depth` | How deep Claude goes (`quick`, `standard`, `thorough`) | `standard` |
-| `max-investigate-turns` | Max Claude turns for investigation | `50` |
-| `max-implement-turns` | Max Claude turns for implementation | `30` |
-
-#### Notification
-
-| Input | Description | Default |
-|-------|-------------|---------|
-| `notification-provider` | Notification channel (`github-summary`, `slack`, `teams`, `discord`, `email`, `webhook`) | `github-summary` |
-| `notification-webhook-url` | Webhook URL for Slack, Teams, Discord, or generic webhook notifications | — |
-| `sendgrid-api-key` | SendGrid API key (when `notification-provider` is `email`) | — |
-| `email-from` | Sender email address (when `notification-provider` is `email`) | — |
-| `email-to` | Recipient email addresses, comma-separated (when `notification-provider` is `email`) | — |
-| `webhook-signing-secret` | HMAC-SHA256 signing secret for generic webhook notifications | — |
-
-#### PR / Branch Settings
-
-| Input | Description | Default |
-|-------|-------------|---------|
-| `base-branch` | Target branch for pull requests | `main` |
-| `pr-labels` | Comma-separated labels to apply to created PRs | `agent,triage,needs-review` |
-
-#### Behavior
-
-| Input | Description | Default |
-|-------|-------------|---------|
-| `dry-run` | Analyze only, don't create PRs | `false` |
-| `novelty-mode` | Only report issues not already tracked | `true` |
-| `review-mode` | PR merge behavior: `auto` (GitHub auto-merge when CI passes, suppressed for high-risk changes) or `review` (human approval) | `review` |
-| `linear-issue` | Issue to implement (e.g., `ENG-123`). Required when `recipe` is `implement`. | — |
-| `additional-instructions` | Extra guidance for Claude | — |
-| `service-map-path` | Path to service ownership map | `.github/service-map.yml` |
-| `github-token` | GitHub token for PRs | `${{ github.token }}` |
-| `bot-token` | Token with cross-repo permissions | — |
-
-### Outputs
-
-| Output | Description |
-|--------|-------------|
-| `issues-found` | Whether issues were found (`true`/`false`) |
-| `recommendation` | What SWEny decided (`implement`, `+1 existing ENG-123`, `skip`) |
-| `issue-identifier` | Issue created or found (e.g., `ENG-456`, `#42`) |
-| `issue-url` | Issue URL |
-| `pr-url` | Pull request URL (if created) |
-| `pr-number` | Pull request number (if created) |
-
-### Permissions
-
-```yaml
-permissions:
-  contents: write       # Create branches and push commits
-  pull-requests: write  # Open pull requests
-```
-
-If using cross-repo dispatch, pass a `bot-token` with `repo` and `actions` scopes for the target repositories.
-
-### Examples
-
-#### Deep investigation of last 7 days
-
-```yaml
-- uses: swenyai/sweny@v1
-  with:
-    claude-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-    dd-api-key: ${{ secrets.DD_API_KEY }}
-    dd-app-key: ${{ secrets.DD_APP_KEY }}
-    time-range: '7d'
-    investigation-depth: 'thorough'
-```
-
-#### Filter to a specific service
-
-```yaml
-- uses: swenyai/sweny@v1
-  with:
-    claude-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-    dd-api-key: ${{ secrets.DD_API_KEY }}
-    dd-app-key: ${{ secrets.DD_APP_KEY }}
-    service-filter: 'billing-*'
-    severity-focus: 'errors'
-    time-range: '4h'
-```
-
-#### Use Linear for issue tracking
-
-```yaml
-- uses: swenyai/sweny@v1
-  with:
-    claude-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-    dd-api-key: ${{ secrets.DD_API_KEY }}
-    dd-app-key: ${{ secrets.DD_APP_KEY }}
-    issue-tracker-provider: 'linear'
-    linear-api-key: ${{ secrets.LINEAR_API_KEY }}
-    linear-team-id: ${{ vars.LINEAR_TEAM_ID }}
-```
-
-#### Work on a specific Linear issue
-
-```yaml
-- uses: swenyai/sweny@v1
-  with:
-    claude-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-    issue-tracker-provider: 'linear'
-    linear-api-key: ${{ secrets.LINEAR_API_KEY }}
-    linear-issue: 'ENG-123'
-    additional-instructions: 'Focus on the webhook handler timeout'
-```
-
-#### Implement a Linear issue (implement recipe)
-
-```yaml
-- uses: swenyai/sweny@v1
-  with:
-    claude-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-    recipe: implement
-    linear-issue: ENG-123
-    linear-api-key: ${{ secrets.LINEAR_API_KEY }}
-    linear-team-id: ${{ vars.LINEAR_TEAM_ID }}
-```
-
-### Service Map
-
-To enable cross-repo dispatch, create `.github/service-map.yml` in your repository:
-
-```yaml
-services:
-  api-gateway:
-    repo: "your-org/api-gateway"
-    owns:
-      - api-gateway
-      - api-gateway-staging
-  billing-service:
-    repo: "your-org/billing"
-    owns:
-      - billing-svc
-      - billing-svc-staging
-```
-
-When SWEny finds an error in `billing-svc`, it matches it to `your-org/billing` and dispatches the fix workflow there automatically.
-
-### Provider Architecture
-
-The engine is provider-agnostic. Every integration is a pluggable provider that maps to a workflow phase:
-
-| Role | Providers |
-|------|-----------|
-| **Learn** | Datadog, Sentry, CloudWatch, Splunk, Elasticsearch, New Relic, Grafana Loki, Prometheus, PagerDuty |
-| **Act** | Linear, GitHub Issues, Jira (issue tracking) -- GitHub, GitLab (source control) |
-| **Incident** | PagerDuty, OpsGenie |
-| **Report** | GitHub Summary, Slack, Teams, Discord, Email (SendGrid), Generic Webhook |
-| **Infrastructure** | Filesystem / S3 / K8s CSI (storage) -- Env Vars / AWS Secrets Manager (credentials) -- API Key / No-Auth (auth) |
-| **AI** | Claude Code, OpenAI Codex, Google Gemini CLI (coding agent) |
-
-Implementing a custom provider means implementing a TypeScript interface -- see [`packages/providers/`](packages/providers/) for the full library and [`@sweny-ai/providers` on npm](https://www.npmjs.com/package/@sweny-ai/providers).
-
----
-
-## @sweny-ai/cli
-
-Run SWEny triage and implement from your terminal — no CI pipeline required.
-
-### Install
-
-```bash
-npm install -g @sweny-ai/cli
-```
-
-### Quick start
-
-**1. Create a config file:**
-
-```bash
-sweny init
-```
-
-This creates `.sweny.yml` — edit it to set your providers:
-
-```yaml
-# .sweny.yml
-observability-provider: datadog
-time-range: 4h
-```
-
-**2. Add secrets to `.env`:**
-
-```bash
-# .env (gitignored)
-CLAUDE_CODE_OAUTH_TOKEN=your-token
-DD_API_KEY=your-api-key
-DD_APP_KEY=your-app-key
-GITHUB_TOKEN=ghp_...
-```
-
-**3. Run:**
-
-```bash
-sweny triage --dry-run
-```
-
-That's it. The CLI auto-loads `.env` and reads settings from `.sweny.yml`. Flags override the config file — use them for one-off changes:
-
-```bash
-sweny triage --dry-run --time-range 1h --service-filter 'billing-*'
-```
-
-### Config file
-
-`.sweny.yml` uses flat kebab-case keys that match CLI flags 1:1:
-
-```yaml
-# .sweny.yml — commit this file. Secrets go in .env.
-observability-provider: file
-log-file: ./logs/errors.json
-issue-tracker-provider: linear
-linear-team-id: your-team-uuid
-cache-dir: .sweny/cache
-```
-
-**Priority:** CLI flag > environment variable > `.sweny.yml` > default
-
-### Step caching
-
-Successful step results are cached to disk. If the workflow crashes or is cancelled after an expensive step (e.g., `investigate` takes 3+ minutes), re-running replays cached steps instantly:
-
-```
-First run:
-  ✓ [1/9] verify-access          0s
-  ✓ [2/9] build-context          1s
-  ✓ [3/9] investigate         3m 6s   → cached
-  ✗ [4/9] novelty-gate           1s   → crash
-
-Re-run:
-  ↻ [1/9] verify-access       cached
-  ↻ [2/9] build-context       cached
-  ↻ [3/9] investigate         cached  → replayed
-  ✓ [4/9] novelty-gate           1s   → runs fresh
-```
-
-Cache flags:
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--cache-dir` | Cache directory | `.sweny/cache` |
-| `--cache-ttl` | TTL in seconds (0 = infinite) | `86400` (24h) |
-| `--no-cache` | Disable caching | — |
-
-### Implement command
-
-Implement a fix for a specific issue and open a PR — no triage needed:
-
-```bash
-sweny implement ENG-123
-sweny implement ENG-123 --dry-run
-sweny implement '#42' --issue-tracker-provider github-issues
-```
-
-`issueId` is passed as a positional argument. The implement command uses its own set of flags:
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--issue-tracker-provider` | `linear`, `jira`, `github-issues`, `file` | `linear` |
-| `--source-control-provider` | `github`, `gitlab`, `file` | `github` |
-| `--coding-agent-provider` | `claude`, `codex`, `gemini` | `claude` |
-| `--dry-run` | Skip creating PR | `false` |
-| `--max-implement-turns` | Max coding agent turns | `40` |
-| `--base-branch` | Base branch for PRs | `main` |
-| `--review-mode` | `auto` or `review` | `review` |
-
-See the [CLI documentation](https://sweny.ai/cli/) for the full inputs reference.
-
----
-
-## @sweny-ai/agent
-
-AI assistant framework powered by [`@anthropic-ai/claude-agent-sdk`](https://docs.anthropic.com/en/docs/claude-code/sdk) — deploy as a Slack bot or CLI with a plugin architecture for custom tools.
-
-See [`packages/agent/`](packages/agent/) for documentation.
-
----
-
-## Studio
-
-Studio is the visual editor and execution monitor for SWEny recipes. It renders any `RecipeDefinition` as an interactive DAG — nodes are color-coded by phase (blue=learn, amber=act, green=report), edges show transition outcomes, and execution state is overlaid in real time.
-
-```bash
-npm run dev --workspace=packages/studio
-```
-
-**Three modes:**
-
-- **Design** — edit the graph, add/remove states, configure transitions and properties, undo/redo. Import and export recipe definitions as JSON.
-- **Simulate** — run the recipe locally in the browser using mock providers. Watch states execute with live status rings.
-- **Live** — connect to a running engine instance over WebSocket or SSE and stream execution events in real time.
-
-Studio uses the same `RecipeDefinition` type the engine executes, so what you see is what runs. The `RecipeViewer` component is embeddable in dashboards and documentation via `@sweny-ai/studio/viewer` — see [`docs/studio.md`](docs/studio.md#embedding-the-viewer).
-
-See [`docs/studio.md`](docs/studio.md) for the full guide.
-
----
+| [`@sweny-ai/core`](packages/core) | Skills, DAG executor, CLI, workflows |
+| [`@sweny-ai/studio`](packages/studio) | Visual DAG editor and execution monitor |
+| [`@sweny-ai/mcp`](packages/mcp) | MCP server for Claude Code / Desktop |
+
+## Links
+
+- [Documentation](https://docs.sweny.ai) — full docs, guides, and reference
+- [Workflow Spec](https://spec.sweny.ai) — formal YAML specification
+- [Marketplace](https://marketplace.sweny.ai) — browse and share workflows
 
 ## Development
 
 ```bash
-# Install dependencies
-npm install
-
-# Build all packages
-npm run build
-
-# Type-check all packages
-npm run typecheck
-
-# Run all tests
-npm test
-
-# Run the CLI locally (auto-loads .env)
-npx tsx packages/cli/src/main.ts triage --dry-run
-
-# Run the agent locally
-npm run cli:agent
-
-# Build the action
-cd packages/action
-npm run package    # Produces dist/index.js via ncc
+npm install          # install all dependencies
+npm run build        # build all packages
+npm test             # run all tests
 ```
-
-> **Note:** The root `dist/` directory is committed intentionally — GitHub Actions require a compiled entry point (`dist/index.js` built via [ncc](https://github.com/vercel/ncc)). Do not remove it.
-
-## Cloud vs. Self-Hosted
-
-sweny.ai cloud manages job execution for you. The worker that runs your jobs
-is open source — you can audit exactly what code runs on your data.
-
-| | sweny.ai Cloud | Self-Hosted Worker |
-|---|---|---|
-| Engine & Providers | Managed | Your infra |
-| Execution | Managed | Your infra |
-| Orchestration UI | Included | Not included |
-| Results History | Included | Not included |
-| BYOK Encryption | Team+ tier | N/A (you control all) |
-| TEE Attestation | Enterprise tier | N/A |
-
-[Deploy your own worker →](docs/self-hosted-worker.md)
-
----
-
-## Documentation
-
-| Guide | Description |
-|-------|-------------|
-| [Recipe Authoring](docs/recipe-authoring.md) | Write, wire, run, and test custom recipes |
-| [Provider Authoring](docs/provider-authoring.md) | Build new observability, issue-tracking, or notification providers |
-| [Studio](docs/studio.md) | Visual recipe editor and execution monitor |
-| [Self-Hosted Worker](docs/self-hosted-worker.md) | Run the engine on your own infrastructure |
-| [Recipe System Spec](packages/engine/SPEC.md) | Formal specification — data model, execution semantics, observer protocol |
-
----
 
 ## License
 

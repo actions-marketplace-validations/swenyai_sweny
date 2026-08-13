@@ -1,0 +1,200 @@
+---
+title: Custom Skills
+description: Create custom instruction and MCP-backed skills for SWEny workflows.
+---
+
+# Custom Skills
+
+Custom skills let you extend SWEny workflows with domain-specific expertise and external tool integrations. There are two approaches: **instruction skills** (natural language guidance) and **MCP skills** (external tool servers).
+
+## Scaffold a skill
+
+The fastest way to start: `sweny skill new <id>`. It writes `.claude/skills/<id>/SKILL.md` with templated frontmatter and a body skeleton.
+
+```bash
+sweny skill new voyage-embeddings -d "Embed text via Voyage AI" -c data
+sweny skill list   # confirms it discovers
+```
+
+Flags: `-d/--description`, `-c/--category` (`general|git|tasks|notification|observability|data`), `--harness` (`claude|sweny|agents|gemini`), `--force`. See [`sweny skill`](/cli/commands/#sweny-skill) for the full reference.
+
+## SKILL.md Format
+
+Create a directory with a `SKILL.md` file:
+
+```
+.sweny/skills/code-standards/
+  SKILL.md
+```
+
+The `SKILL.md` uses YAML frontmatter for metadata and markdown for the instruction:
+
+````markdown
+---
+name: code-standards
+description: Team coding conventions for TypeScript
+---
+
+When writing or reviewing TypeScript code:
+- Use camelCase for variables and functions
+- Use PascalCase for types, interfaces, and classes
+- Every public function needs at least one test
+- Mock at boundaries (HTTP, DB), not internal functions
+````
+
+### Frontmatter Fields
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `name` | Yes | Skill ID. Lowercase letters, numbers, hyphens (no consecutive `--`), max 64 chars. Must match the directory name. |
+| `description` | No | One-line summary shown in `sweny skill list`. Falls back to `Custom skill: <name>` if omitted. |
+| `category` | No | One of `general`, `git`, `tasks`, `notification`, `observability`, `data`. Drives per-node category validation. Defaults to `general` (also when the value is invalid). |
+| `config` | No | Map of env-var-backed config fields the skill needs (see below). |
+| `mcp` | No | MCP server config (see [MCP Skills](#mcp-skills)). |
+
+### Declaring required env vars
+
+If your skill needs environment variables, declare them under `config:`. `sweny check` and the workflow pre-flight use this to verify the env is set before running:
+
+```markdown
+---
+name: voyage-embeddings
+description: Embed text via Voyage AI
+category: data
+config:
+  VOYAGE_API_KEY:
+    description: API key for the Voyage AI embeddings service
+    required: true
+---
+
+When embedding documents, use `voyage-3-large` for retrieval and `voyage-3-lite` when latency matters.
+```
+
+The map key is the env var name. `description` is shown by `sweny check`; `required: true` makes the skill unavailable when the var is missing.
+
+## Instruction Skills
+
+The simplest custom skill: the markdown body is injected into the prompt when a workflow node references this skill.
+
+```yaml
+# In your workflow:
+nodes:
+  review:
+    name: Code Review
+    instruction: Review the pull request for issues.
+    skills: [code-standards]  # injects your SKILL.md content
+```
+
+Use instruction skills for:
+- Coding standards and conventions
+- Evaluation rubrics and scoring criteria
+- Domain-specific knowledge
+- Process guidelines
+
+## MCP Skills
+
+Add an `mcp` field to the frontmatter to declare an MCP server:
+
+````markdown
+---
+name: our-crm
+description: Company CRM integration
+mcp:
+  command: npx
+  args: ["-y", "@company/crm-mcp-server"]
+  env:
+    CRM_API_KEY: CRM API key
+---
+
+Use the CRM tools to look up customer data. Always search by email first.
+````
+
+The MCP server is wired only for nodes that reference this skill — not globally.
+
+### MCP Transport Types
+
+**stdio** (local process):
+```yaml
+mcp:
+  command: npx
+  args: ["-y", "@company/server"]
+  env:
+    API_KEY: Description of the key
+```
+
+:::caution[stdio commands are a trust boundary]
+A discovered `SKILL.md` with a stdio `mcp.command` spawns a local process when the skill is referenced, and SWEny runs the harness with permissions bypassed. A `SKILL.md` dropped via a PR or supply-chain dependency is therefore a code-execution sink.
+
+For safety, SWEny does **not** wire a discovered stdio command by default. It emits a `stdio-command-declared` diagnostic (surfaced as a warning in `sweny skill list` and run pre-flight) and skips launching the command. To opt in for a vetted skill, set `SWENY_ALLOW_SKILL_STDIO_COMMAND=1` in the environment. HTTP-type (`mcp.url`) skills and skills with no `mcp` are unaffected.
+:::
+
+**HTTP** (remote endpoint):
+```yaml
+mcp:
+  url: https://mcp.example.com/mcp
+  headers:
+    Authorization: Bearer your-token-here
+```
+
+Note: Header values are passed as-is (no variable interpolation). Use literal values or configure them via your environment.
+
+## Inline Workflow Skills
+
+For skills that only make sense within a single workflow, define them inline:
+
+```yaml
+id: incident-postmortem
+name: Incident Postmortem
+entry: gather
+skills:
+  sre-rubric:
+    name: SRE Postmortem Rubric
+    instruction: |
+      Score each dimension 1-5:
+      - Completeness
+      - Root Cause Depth
+      - Blamelessness
+      - Action Items
+nodes:
+  gather:
+    name: Gather Timeline
+    instruction: Reconstruct the incident timeline.
+    skills: [github, sentry]
+  draft:
+    name: Draft Postmortem
+    instruction: Write a blameless postmortem.
+    skills: [sre-rubric]
+```
+
+## Skill Discovery Directories
+
+SWEny discovers skills from multiple directories, making workflows portable across AI coding tools:
+
+| Priority | Directory | Tool |
+|----------|-----------|------|
+| 1 (highest) | `.sweny/skills/` | SWEny |
+| 2 | `.claude/skills/` | Claude Code |
+| 3 | `.agents/skills/` | Codex, Gemini CLI, OpenCode |
+| 4 | `.gemini/skills/` | Gemini CLI |
+
+If the same skill ID exists in multiple directories, the highest-priority directory wins.
+
+### Overriding Built-in Skills
+
+Place a custom skill with the same ID as a built-in (e.g., `github`):
+
+```
+.sweny/skills/github/SKILL.md
+```
+
+The built-in tools remain available — your instruction is added on top. Use this to provide team-specific guidance like "Use our GitHub Enterprise instance at github.corp.com."
+
+## Cross-Tool Compatibility
+
+Skills authored as `SKILL.md` files follow the [Agent Skills Open Standard](https://agentskills.io). This means:
+- Claude Code reads skills from `.claude/skills/`
+- Codex reads from `.agents/skills/`
+- Gemini CLI reads from `.gemini/skills/`
+- SWEny reads from all of the above
+
+Write your skill once, put it in `.agents/skills/` (the universal directory), and it works everywhere.

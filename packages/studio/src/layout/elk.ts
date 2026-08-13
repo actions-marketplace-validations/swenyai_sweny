@@ -1,59 +1,91 @@
-import ELK, { type ElkNode, type ElkExtendedEdge } from "elkjs";
+import ELK from "elkjs/lib/elk.bundled.js";
+import type { ElkNode, ElkExtendedEdge } from "elkjs";
 import type { Edge } from "@xyflow/react";
-import type { RecipeDefinition } from "@sweny-ai/engine";
+import type { Workflow } from "@sweny-ai/core";
+import { workflowToFlow } from "@sweny-ai/core/studio";
 import type { StateNodeType } from "../components/StateNode.js";
 import type { TransitionEdgeData } from "../components/TransitionEdge.js";
-import { definitionToFlow, extractTransitions } from "../lib/definition-to-flow.js";
 
 const elk = new ELK();
 
-const NODE_WIDTH = 200;
-const NODE_HEIGHT = 40;
+const DEFAULT_NODE_WIDTH = 280;
+const DEFAULT_NODE_HEIGHT = 84;
 
-export async function layoutDefinition(def: RecipeDefinition): Promise<{
+export interface LayoutOptions {
+  nodeWidth?: number;
+  nodeHeight?: number;
+}
+
+export async function layoutWorkflow(
+  workflow: Workflow,
+  options?: LayoutOptions,
+): Promise<{
   nodes: StateNodeType[];
   edges: Edge<TransitionEdgeData>[];
 }> {
-  const { nodes: rfNodes, edges: rfEdges } = definitionToFlow(def);
-  const transitions = extractTransitions(def);
+  const nodeWidth = options?.nodeWidth ?? DEFAULT_NODE_WIDTH;
+  const nodeHeight = options?.nodeHeight ?? DEFAULT_NODE_HEIGHT;
+  const { nodes: flowNodes, edges: flowEdges } = workflowToFlow(workflow);
 
   const elkGraph = {
     id: "root",
     layoutOptions: {
       "elk.algorithm": "layered",
       "elk.direction": "DOWN",
-      "elk.spacing.nodeNode": "40",
-      "elk.layered.spacing.edgeNodeBetweenLayers": "36",
+      "elk.spacing.nodeNode": "60",
+      "elk.layered.spacing.edgeNodeBetweenLayers": "50",
       "elk.layered.nodePlacement.strategy": "BRANDES_KOEPF",
     },
-    children: rfNodes.map(
-      (node): ElkNode => ({
-        id: node.id,
-        width: NODE_WIDTH,
-        height: NODE_HEIGHT,
-      }),
-    ),
-    edges: transitions.map(
-      ({ source, target, label }): ElkExtendedEdge => ({
-        id: `${source}--${label}--${target}`,
-        sources: [source],
-        targets: [target],
-      }),
-    ),
+    children: flowNodes.map((node): ElkNode => ({
+      id: node.id,
+      width: nodeWidth,
+      height: nodeHeight,
+    })),
+    edges: flowEdges.map((edge): ElkExtendedEdge => ({
+      id: edge.id,
+      sources: [edge.source],
+      targets: [edge.target],
+    })),
   };
 
   const layout = await elk.layout(elkGraph);
 
-  const positionedNodes: StateNodeType[] = rfNodes.map((node) => {
-    const elkNode = layout.children?.find((c) => c.id === node.id);
+  // Map core FlowNode to Studio StateNodeType
+  const positionedNodes: StateNodeType[] = flowNodes.map((flowNode) => {
+    const elkNode = layout.children?.find((c) => c.id === flowNode.id);
     return {
-      ...node,
+      id: flowNode.id,
+      type: "skillNode" as const,
       position: {
         x: elkNode?.x ?? 0,
         y: elkNode?.y ?? 0,
       },
+      style: { width: nodeWidth, minHeight: nodeHeight },
+      initialWidth: nodeWidth,
+      initialHeight: nodeHeight,
+      data: {
+        nodeId: flowNode.data.nodeId,
+        node: flowNode.data.node,
+        isEntry: flowNode.data.isEntry,
+        isTerminal: flowNode.data.isTerminal,
+        skills: flowNode.data.skills,
+        execStatus: "pending" as const,
+      },
     };
   });
 
-  return { nodes: positionedNodes, edges: rfEdges };
+  const edges: Edge<TransitionEdgeData>[] = flowEdges.map((flowEdge) => ({
+    id: flowEdge.id,
+    source: flowEdge.source,
+    target: flowEdge.target,
+    type: "conditionEdge" as const,
+    data: {
+      when: flowEdge.data.when,
+      max_iterations: flowEdge.data.max_iterations,
+      edgeIndex: flowEdge.edgeIndex,
+      isConditional: flowEdge.data.isConditional,
+    },
+  }));
+
+  return { nodes: positionedNodes, edges };
 }

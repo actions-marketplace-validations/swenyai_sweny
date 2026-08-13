@@ -1,310 +1,147 @@
-name: "SWEny AI"
-description: "Autonomous SRE triage — monitors logs, investigates issues, creates tickets, and opens fix PRs."
+name: "SWEny — Run AI Workflow"
+description: "Run any SWEny workflow YAML on GitHub Actions. See also swenyai/triage and swenyai/e2e."
 author: "SWEny"
 
 branding:
-  icon: "activity"
+  icon: "play"
   color: "orange"
 
 inputs:
-  recipe:
-    description: "Recipe to run (triage, implement). Default: triage."
-    required: false
-    default: "triage"
+  workflow:
+    description: "Path to the workflow YAML file to execute (relative to working-directory)."
+    required: true
 
-  anthropic-api-key:
-    description: "Anthropic API key for Claude (use this OR claude-oauth-token)"
-    required: false
   claude-oauth-token:
-    description: "Claude Code OAuth token (use this OR anthropic-api-key)"
+    description: "Claude Code OAuth token. Use this OR anthropic-api-key. OAuth tokens do not consume API credit."
     required: false
+  anthropic-api-key:
+    description: "Anthropic API key for Claude (x-api-key). Use this OR claude-oauth-token."
+    required: false
+  anthropic-auth-token:
+    description: "Bearer token (Authorization: Bearer) for gateways that expect it. Sets ANTHROPIC_AUTH_TOKEN. Distinct from anthropic-api-key (x-api-key)."
+    required: false
+  anthropic-base-url:
+    description: "Anthropic-compatible base URL (e.g. a LiteLLM gateway). Sets ANTHROPIC_BASE_URL. See docs: Using a model gateway."
+    required: false
+  sweny-auth:
+    description: "Auth mode: auto (default), api-key, or oauth. Set 'api-key' to authenticate a gateway with anthropic-api-key / anthropic-auth-token even when an OAuth token is also present."
+    required: false
+    default: "auto"
 
-  # Coding agent provider
-  coding-agent-provider:
-    description: "Coding agent to use for implementation (claude, codex, gemini)"
+  cli-version:
+    description: "Version of @sweny-ai/core to install (the package that ships the `sweny` CLI). Defaults to latest."
     required: false
-    default: "claude"
+    default: "latest"
 
-  # OpenAI credentials (when coding-agent-provider = codex)
-  openai-api-key:
-    description: "OpenAI API key (required when coding-agent-provider is codex)"
+  node-version:
+    description: "Node.js version to install."
     required: false
+    default: "24"
 
-  # Google credentials (when coding-agent-provider = gemini)
-  gemini-api-key:
-    description: "Google Gemini API key (required when coding-agent-provider is gemini)"
+  working-directory:
+    description: "Working directory to run the workflow from. Defaults to the repository root."
     required: false
+    default: "."
 
-  # Observability provider
-  observability-provider:
-    description: "Observability provider to use (datadog, sentry, cloudwatch, splunk, elastic, newrelic, loki, file)"
-    required: false
-    default: "datadog"
-
-  # Datadog credentials
-  dd-api-key:
-    description: "Datadog API key"
-    required: false
-  dd-app-key:
-    description: "Datadog Application key"
-    required: false
-  dd-site:
-    description: "Datadog site (e.g., datadoghq.com, datadoghq.eu)"
-    required: false
-    default: "datadoghq.com"
-
-  # Sentry credentials
-  sentry-auth-token:
-    description: "Sentry auth token"
-    required: false
-  sentry-org:
-    description: "Sentry organization slug"
-    required: false
-  sentry-project:
-    description: "Sentry project slug"
-    required: false
-  sentry-base-url:
-    description: "Sentry base URL (default: https://sentry.io)"
-    required: false
-    default: "https://sentry.io"
-
-  # CloudWatch credentials
-  cloudwatch-region:
-    description: "AWS region for CloudWatch Logs"
-    required: false
-    default: "us-east-1"
-  cloudwatch-log-group-prefix:
-    description: "CloudWatch log group name or prefix"
-    required: false
-
-  # Splunk credentials
-  splunk-url:
-    description: "Splunk REST API base URL (e.g., https://splunk.example.com:8089)"
-    required: false
-  splunk-token:
-    description: "Splunk authentication token"
-    required: false
-  splunk-index:
-    description: "Splunk index to search"
-    required: false
-    default: "main"
-
-  # Elasticsearch credentials
-  elastic-url:
-    description: "Elasticsearch base URL (e.g., https://elastic.example.com:9200)"
-    required: false
-  elastic-api-key:
-    description: "Elasticsearch API key"
-    required: false
-  elastic-index:
-    description: "Elasticsearch index pattern"
-    required: false
-    default: "logs-*"
-
-  # New Relic credentials
-  newrelic-api-key:
-    description: "New Relic API key (NRAK-...)"
-    required: false
-  newrelic-account-id:
-    description: "New Relic account ID"
-    required: false
-  newrelic-region:
-    description: "New Relic region (us or eu)"
-    required: false
-    default: "us"
-
-  # Grafana Loki credentials
-  loki-url:
-    description: "Loki base URL (e.g., https://loki.example.com)"
-    required: false
-  loki-api-key:
-    description: "Loki API key (optional)"
-    required: false
-  loki-org-id:
-    description: "Loki tenant/org ID (optional)"
-    required: false
-
-  # File provider (when observability-provider = file)
-  log-file-path:
-    description: "Path to a local JSON log file (required when observability-provider is file)"
-    required: false
-
-  # Issue tracker provider
-  issue-tracker-provider:
-    description: "Issue tracker provider to use (github-issues, linear, jira)"
-    required: false
-    default: "github-issues"
-  linear-api-key:
-    description: "Linear API key"
-    required: false
-  linear-team-id:
-    description: "Linear team UUID"
-    required: false
-  linear-bug-label-id:
-    description: "Linear label UUID for bugs"
-    required: false
-  linear-triage-label-id:
-    description: "Linear label UUID for agent-triage issues"
-    required: false
-  linear-state-backlog:
-    description: "Linear workflow state UUID for Backlog"
-    required: false
-  linear-state-in-progress:
-    description: "Linear workflow state UUID for In Progress"
-    required: false
-  linear-state-peer-review:
-    description: "Linear workflow state UUID for Peer Review"
-    required: false
-
-  # Jira credentials (when issue-tracker-provider = jira)
-  jira-base-url:
-    description: "Jira base URL (e.g., https://myco.atlassian.net)"
-    required: false
-  jira-email:
-    description: "Jira user email for API authentication"
-    required: false
-  jira-api-token:
-    description: "Jira API token"
-    required: false
-
-  # Source control provider
-  source-control-provider:
-    description: "Source control provider to use (github, gitlab)"
-    required: false
-    default: "github"
-
-  # GitLab credentials (when source-control-provider = gitlab)
-  gitlab-token:
-    description: "GitLab personal access token"
-    required: false
-  gitlab-project-id:
-    description: "GitLab project ID or path (e.g., my-group/my-project)"
-    required: false
-  gitlab-base-url:
-    description: "GitLab instance base URL"
-    required: false
-    default: "https://gitlab.com"
-
-  # Notification provider
-  notification-provider:
-    description: "Notification provider (github-summary, slack, teams, discord, email, webhook, slack-mcp)"
-    required: false
-    default: "github-summary"
-  notification-webhook-url:
-    description: "Webhook URL for Slack, Teams, Discord, or generic webhook notifications"
-    required: false
-  sendgrid-api-key:
-    description: "SendGrid API key (when notification-provider = email)"
-    required: false
-  email-from:
-    description: "Sender email address (when notification-provider = email)"
-    required: false
-  email-to:
-    description: "Recipient email addresses, comma-separated (when notification-provider = email)"
-    required: false
-  webhook-signing-secret:
-    description: "HMAC-SHA256 signing secret for generic webhook notifications"
-    required: false
-  output-dir:
-    description: "Directory for file-based provider output (dry-run / file providers)"
-    required: false
-    default: ".github/sweny-output"
-
-  # Investigation parameters
-  time-range:
-    description: "Time range to analyze (e.g., 1h, 6h, 24h, 7d)"
-    required: false
-    default: "24h"
-  severity-focus:
-    description: "Primary focus area (errors, warnings, all)"
-    required: false
-    default: "errors"
-  service-filter:
-    description: "Service filter pattern (e.g., my-service, api-*, *)"
-    required: false
-    default: "*"
-  investigation-depth:
-    description: "How deep Claude should investigate (quick, standard, thorough)"
-    required: false
-    default: "standard"
-  max-investigate-turns:
-    description: "Maximum Claude turns for investigation phase"
-    required: false
-    default: "50"
-  max-implement-turns:
-    description: "Maximum Claude turns for implementation phase"
-    required: false
-    default: "30"
-
-  # PR / branch settings
-  base-branch:
-    description: "Target branch for PRs (e.g., main, master, develop)"
-    required: false
-    default: "main"
-  pr-labels:
-    description: "Comma-separated list of labels to apply to created PRs"
-    required: false
-    default: "agent,triage,needs-review"
-
-  # Behavior
   dry-run:
-    description: "Dry run mode — analyze only, do not create PRs"
+    description: "When 'true', execute until the first conditional routing decision and stop. Validates the workflow end-to-end without triggering downstream actions."
     required: false
     default: "false"
-  review-mode:
-    description: "PR merge behavior: 'auto' (enable GitHub auto-merge when CI passes — automatically suppressed for high-risk changes such as migrations, auth, lockfiles, or >20 files), 'review' (open PR and wait for human approval)"
+
+  verbose:
+    description: "When 'true', print each tool call's input and output inline. Truncated for readability; use the CLI's --stream flag locally for full untruncated NDJSON. Helpful for debugging a node that halts or fails."
     required: false
-    default: "review"
-  novelty-mode:
-    description: "Only report novel issues not already tracked in Linear/GitHub"
-    required: false
-    default: "true"
-  linear-issue:
-    description: "Existing Linear issue to work on (e.g., ENG-123). Skips log investigation."
+    default: "false"
+
+  input:
+    description: |
+      JSON object of per-run inputs for the workflow. Forwarded verbatim to
+      `sweny workflow run --input '<json>'`. When the workflow declares an
+      `inputs` block, the CLI validates this string against the declaration
+      (type-check, required-field check, default-fill) and fails with a
+      readable diff when the shape doesn't match. When the workflow does NOT
+      declare `inputs`, the JSON is passed through unchanged for back-compat.
+
+      Example (release-notes-style):
+        input: |
+          {
+            "since_tag": "v1.41.12",
+            "until_tag": "v1.41.13",
+            "draft": true
+          }
     required: false
     default: ""
-  additional-instructions:
-    description: 'Additional instructions for Claude (e.g., "focus on the webhook handler")'
-    required: false
-    default: ""
-  service-map-path:
-    description: "Path to the service ownership map YAML file"
-    required: false
-    default: ".github/service-map.yml"
 
-  # GitHub tokens
-  github-token:
-    description: "GitHub token for API access and PR creation"
+  cloud-token:
+    description: "Project token (sweny_pk_...) enabling opt-in run reporting. Optional, and not currently available. Token minting is not yet exposed, so leaving this unset (the default) means no outbound reporting request is made. Equivalent to setting the SWENY_CLOUD_TOKEN env var; either form is accepted."
     required: false
-    default: "${{ github.token }}"
-  bot-token:
-    description: "Optional bot token with elevated permissions (for cross-repo dispatch, push to protected branches)"
-    required: false
-
-  # MCP servers
-  mcp-servers:
-    description: >-
-      MCP servers as a JSON object passed to the coding agent. Each key is a server name;
-      each value is an MCPServerConfig (fields: type, command, args, env, url, headers).
-      Example — GitHub MCP server:
-        {"github":{"type":"stdio","command":"npx","args":["-y","@modelcontextprotocol/server-github@latest"],"env":{"GITHUB_PERSONAL_ACCESS_TOKEN":"${{ secrets.GH_PAT }}"}}}
-      See docs/mcp-servers.md for a full catalog including Sentry, filesystem, and HTTP servers.
-    required: false
-
-outputs:
-  issues-found:
-    description: "Whether any issues were found during investigation (true/false)"
-  recommendation:
-    description: "Investigation recommendation (implement, +1 existing ENG-XXX, skip)"
-  issue-identifier:
-    description: "Linear issue identifier (e.g., ENG-123)"
-  issue-url:
-    description: "Linear issue URL"
-  pr-url:
-    description: "URL of the created pull request"
-  pr-number:
-    description: "Number of the created pull request"
 
 runs:
-  using: "node20"
-  main: "dist/index.js"
+  using: "composite"
+  steps:
+    - name: Validate auth inputs
+      shell: bash
+      env:
+        HAS_OAUTH: ${{ inputs.claude-oauth-token != '' }}
+        HAS_API_KEY: ${{ inputs.anthropic-api-key != '' }}
+        HAS_AUTH_TOKEN: ${{ inputs.anthropic-auth-token != '' }}
+      run: |
+        if [ "$HAS_OAUTH" != "true" ] && [ "$HAS_API_KEY" != "true" ] && [ "$HAS_AUTH_TOKEN" != "true" ]; then
+          echo "::error::Provide one of: claude-oauth-token, anthropic-api-key, or anthropic-auth-token"
+          exit 1
+        fi
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v7
+      with:
+        node-version: ${{ inputs.node-version }}
+
+    - name: Install SWEny CLI
+      shell: bash
+      env:
+        CLI_VERSION: ${{ inputs.cli-version }}
+      run: npm install -g "@sweny-ai/core@${CLI_VERSION}"
+
+    - name: Run workflow
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        CLAUDE_CODE_OAUTH_TOKEN: ${{ inputs.claude-oauth-token }}
+        ANTHROPIC_API_KEY: ${{ inputs.anthropic-api-key }}
+        ANTHROPIC_AUTH_TOKEN: ${{ inputs.anthropic-auth-token }}
+        ANTHROPIC_BASE_URL: ${{ inputs.anthropic-base-url }}
+        SWENY_AUTH: ${{ inputs.sweny-auth }}
+        WORKFLOW_PATH: ${{ inputs.workflow }}
+        DRY_RUN: ${{ inputs.dry-run }}
+        VERBOSE: ${{ inputs.verbose }}
+        WORKFLOW_INPUT: ${{ inputs.input }}
+        INPUT_CLOUD_TOKEN: ${{ inputs.cloud-token }}
+      run: |
+        # Forward the cloud token to the CLI. Prefer the explicit `cloud-token`
+        # input; otherwise honor whatever the caller put on the step env as
+        # SWENY_CLOUD_TOKEN. Never overwrite a non-empty inherited value with
+        # an empty input.
+        if [ -n "$INPUT_CLOUD_TOKEN" ]; then
+          export SWENY_CLOUD_TOKEN="$INPUT_CLOUD_TOKEN"
+        fi
+        # Normalize boolean-ish inputs (true / TRUE / 1 / yes).
+        normalize() {
+          local v
+          v=$(echo "${1:-false}" | tr '[:upper:]' '[:lower:]')
+          case "$v" in true|1|yes) echo "true" ;; *) echo "false" ;; esac
+        }
+        DRY_NORM=$(normalize "$DRY_RUN")
+        VERBOSE_NORM=$(normalize "$VERBOSE")
+
+        FLAGS=()
+        [ "$DRY_NORM" = "true" ] && FLAGS+=("--dry-run")
+        [ "$VERBOSE_NORM" = "true" ] && FLAGS+=("--verbose")
+        # Forward per-run inputs verbatim. Pass through env to avoid shell
+        # quoting issues with nested JSON; the CLI parses and validates the
+        # string against the workflow's declared `inputs` block (if any) and
+        # fails with a readable error when the shape doesn't match.
+        if [ -n "$WORKFLOW_INPUT" ]; then
+          FLAGS+=("--input" "$WORKFLOW_INPUT")
+        fi
+
+        sweny workflow run "$WORKFLOW_PATH" "${FLAGS[@]}"

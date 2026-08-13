@@ -1,38 +1,50 @@
-import { useState, useEffect, useRef } from "react";
-import { ReactFlow, Background, Controls, MiniMap, useReactFlow, type NodeMouseHandler } from "@xyflow/react";
+import { useState, useEffect, useRef, useCallback } from "react";
+import {
+  ReactFlow,
+  Background,
+  Controls,
+  MiniMap,
+  useReactFlow,
+  applyNodeChanges,
+  applyEdgeChanges,
+  type NodeChange,
+  type EdgeChange,
+  type NodeMouseHandler,
+} from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import type { RecipeDefinition } from "@sweny-ai/engine";
+import type { Workflow } from "@sweny-ai/core";
 import { StateNode } from "./StateNode.js";
 import { TransitionEdge } from "./TransitionEdge.js";
-import { layoutDefinition } from "../layout/elk.js";
-import type { StateNodeType, StateNodeData } from "./StateNode.js";
+import { layoutWorkflow, type LayoutOptions } from "../layout/elk.js";
+import type { StateNodeType, StateNodeData, NodeExecStatus } from "./StateNode.js";
 import type { Edge } from "@xyflow/react";
 import type { TransitionEdgeData } from "./TransitionEdge.js";
 
-const nodeTypes = { stateNode: StateNode };
-const edgeTypes = { transitionEdge: TransitionEdge };
+const nodeTypes = { skillNode: StateNode };
+const edgeTypes = { conditionEdge: TransitionEdge };
 
-const EMPTY_EXECUTION_STATE: Record<string, "current" | "success" | "failed" | "skipped"> = {};
+const EMPTY_EXECUTION_STATE: Record<string, NodeExecStatus> = {};
 
-export interface RecipeViewerProps {
-  /** The RecipeDefinition to visualize. */
-  definition: RecipeDefinition;
+export interface WorkflowViewerProps {
+  /** The Workflow to visualize. */
+  workflow: Workflow;
   /**
-   * Highlight these state ids (e.g. from a live execution).
-   * Keys are state ids, values are the execution status.
+   * Highlight these node ids (e.g. from a live execution).
+   * Keys are node ids, values are the execution status.
    */
-  executionState?: Record<string, "current" | "success" | "failed" | "skipped">;
+  executionState?: Record<string, NodeExecStatus>;
   /** Canvas height. Defaults to "100%". */
   height?: string | number;
   /** Called when the user clicks a node. */
-  onNodeClick?: (stateId: string) => void;
+  onNodeClick?: (nodeId: string) => void;
+  /** Show the minimap overlay. Defaults to true. */
+  showMiniMap?: boolean;
+  /** Node width in pixels for ELK layout. Defaults to 280. */
+  nodeWidth?: number;
+  /** Node height in pixels for ELK layout. Defaults to 84. */
+  nodeHeight?: number;
 }
 
-/**
- * Rendered inside <ReactFlow> so it has access to the ReactFlow context.
- * Calls fitView() after ELK places nodes — fixes the blank-canvas bug where
- * the fitView prop runs on mount (empty nodes) and never re-fires.
- */
 function AutoFitView({ nodeCount }: { nodeCount: number }) {
   const { fitView } = useReactFlow();
   const prevCount = useRef(0);
@@ -40,11 +52,9 @@ function AutoFitView({ nodeCount }: { nodeCount: number }) {
   useEffect(() => {
     if (nodeCount > 0 && nodeCount !== prevCount.current) {
       prevCount.current = nodeCount;
-      // Two rAFs: first lets React flush the node positions,
-      // second lets ReactFlow measure them before fitting.
       requestAnimationFrame(() => {
         requestAnimationFrame(() => {
-          fitView({ padding: 0.1, duration: 450, minZoom: 0.4 });
+          fitView({ padding: 0.15, duration: 450, minZoom: 0.15 });
         });
       });
     }
@@ -53,22 +63,27 @@ function AutoFitView({ nodeCount }: { nodeCount: number }) {
   return null;
 }
 
-export function RecipeViewer({
-  definition,
+export function WorkflowViewer({
+  workflow,
   executionState = EMPTY_EXECUTION_STATE,
   height = "100%",
   onNodeClick,
-}: RecipeViewerProps) {
+  showMiniMap = true,
+  nodeWidth,
+  nodeHeight,
+}: WorkflowViewerProps) {
   const [nodes, setNodes] = useState<StateNodeType[]>([]);
   const [edges, setEdges] = useState<Edge<TransitionEdgeData>[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
-  // Re-run ELK only when the definition changes (structure change).
   useEffect(() => {
     setError(null);
     setLoading(true);
-    layoutDefinition(definition)
+    const layoutOpts: LayoutOptions = {};
+    if (nodeWidth) layoutOpts.nodeWidth = nodeWidth;
+    if (nodeHeight) layoutOpts.nodeHeight = nodeHeight;
+    layoutWorkflow(workflow, layoutOpts)
       .then(({ nodes: n, edges: e }) => {
         setNodes(
           n.map((node) => ({
@@ -86,10 +101,8 @@ export function RecipeViewer({
         setError(`Layout failed: ${err instanceof Error ? err.message : String(err)}`);
         setLoading(false);
       });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [definition]);
+  }, [workflow, nodeWidth, nodeHeight]);
 
-  // Update execution highlights without re-running ELK.
   useEffect(() => {
     setNodes((prev) =>
       prev.map((node) => ({
@@ -103,8 +116,17 @@ export function RecipeViewer({
   }, [executionState]);
 
   const handleNodeClick: NodeMouseHandler<StateNodeType> = (_evt, node) => {
-    onNodeClick?.(node.data.stateId);
+    onNodeClick?.(node.data.nodeId);
   };
+
+  const onNodesChange = useCallback(
+    (changes: NodeChange<StateNodeType>[]) => setNodes((nds) => applyNodeChanges(changes, nds)),
+    [],
+  );
+  const onEdgesChange = useCallback(
+    (changes: EdgeChange<Edge<TransitionEdgeData>>[]) => setEdges((eds) => applyEdgeChanges(changes, eds)),
+    [],
+  );
 
   if (error) {
     return (
@@ -167,13 +189,15 @@ export function RecipeViewer({
           0%, 100% { box-shadow: 0 0 0 2.5px #3b82f6, 0 0 20px rgba(59,130,246,0.4); }
           50%       { box-shadow: 0 0 0 2.5px #3b82f6, 0 0 30px rgba(59,130,246,0.65); }
         }
-        .react-flow__node[data-exec-status="current"] > div {
+        .sweny-node-pulse {
           animation: node-pulse 2s ease-in-out infinite;
         }
       `}</style>
       <ReactFlow
         nodes={nodes}
         edges={edges}
+        onNodesChange={onNodesChange}
+        onEdgesChange={onEdgesChange}
         nodeTypes={nodeTypes}
         edgeTypes={edgeTypes}
         nodesDraggable={false}
@@ -183,7 +207,7 @@ export function RecipeViewer({
         fitView={false}
         colorMode="dark"
         defaultEdgeOptions={{
-          type: "transitionEdge",
+          type: "conditionEdge",
           markerEnd: { type: "arrowclosed" as const, color: "#4d7aaa", width: 20, height: 20 },
         }}
       >
@@ -193,17 +217,18 @@ export function RecipeViewer({
           showInteractive={false}
           style={{ background: "#0d1827", border: "1px solid #1e3050", borderRadius: 8 }}
         />
-        <MiniMap
-          style={{ background: "#080f1e", border: "1px solid #1e293b", borderRadius: 8 }}
-          maskColor="rgba(8,14,30,0.8)"
-          nodeColor={(node) => {
-            const d = node.data as StateNodeData;
-            if (d?.state?.phase === "learn") return "#3b82f6";
-            if (d?.state?.phase === "act") return "#f59e0b";
-            if (d?.state?.phase === "report") return "#10b981";
-            return "#334155";
-          }}
-        />
+        {showMiniMap && (
+          <MiniMap
+            style={{ background: "#080f1e", border: "1px solid #1e293b", borderRadius: 8 }}
+            maskColor="rgba(8,14,30,0.8)"
+            nodeColor={(node) => {
+              const d = node.data as StateNodeData;
+              if (d?.isEntry) return "#3b82f6";
+              if (d?.isTerminal) return "#10b981";
+              return "#334155";
+            }}
+          />
+        )}
       </ReactFlow>
     </div>
   );

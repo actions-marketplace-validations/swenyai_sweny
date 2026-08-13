@@ -13,18 +13,13 @@
     "build": "npm run build --workspaces --if-present",
     "typecheck": "npm run typecheck --workspaces --if-present",
     "test": "npm run test --workspaces --if-present",
-    "dev:agent": "npm run dev --workspace=packages/agent",
-    "cli:agent": "npm run cli --workspace=packages/agent",
     "dev:web": "npm run dev --workspace=packages/web",
     "build:web": "npm run build --workspace=packages/web",
-    "dev:cli": "npm run dev --workspace=packages/cli",
-    "cli:triage": "npm run dev --workspace=packages/cli -- triage",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
-    "prepare": "husky",
-    "release": "changeset publish"
+    "prepare": "husky"
   },
   "license": "MIT",
   "homepage": "https://sweny.ai",
@@ -42,16 +37,30 @@
     ]
   },
   "overrides": {
-    "svgo": "^4.0.1"
+    "svgo": "^4.0.1",
+    "fast-xml-parser": ">=5.5.7",
+    "h3": "^1.15.6",
+    "picomatch": "^4.0.4",
+    "anymatch": {
+      "picomatch": "^2.3.2"
+    },
+    "micromatch": {
+      "picomatch": "^2.3.2"
+    },
+    "readdirp": {
+      "picomatch": "^2.3.2"
+    }
   },
   "devDependencies": {
-    "@changesets/cli": "^2.30.0",
-    "@typescript-eslint/eslint-plugin": "^8.56.1",
-    "@typescript-eslint/parser": "^8.56.1",
-    "eslint": "^10.0.3",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "zod": "^3.25.76",
+    "@typescript-eslint/eslint-plugin": "^8.65.0",
+    "@typescript-eslint/parser": "^8.65.0",
+    "eslint": "^10.8.0",
     "eslint-config-prettier": "^10.1.8",
     "husky": "^9.1.7",
-    "lint-staged": "^16.3.2",
-    "prettier": "^3.8.1"
+    "lint-staged": "^17.2.0",
+    "prettier": "^3.9.6"
   }
 }

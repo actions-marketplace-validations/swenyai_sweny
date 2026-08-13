@@ -1,31 +1,78 @@
 ---
 title: CLI Quick Start
-description: Run SWEny triage workflows from your terminal.
+description: Install the SWEny CLI and build your first workflow in under a minute.
 ---
 
-The SWEny CLI lets you run triage workflows locally — no CI pipeline required. Use it to validate your setup, test against local log files, or run investigations on demand.
+The SWEny CLI is how you build, run, and iterate on AI workflows from your terminal. Describe what you want done in plain English, and SWEny generates a full DAG with the right tools wired up at each step.
 
 ## Install
 
 ```bash
-npm install -g @sweny-ai/cli
+npm install -g @sweny-ai/core
 ```
 
-Or run directly with `npx`:
+The binary is called `sweny`. You can also run it directly with `npx`:
 
 ```bash
-npx @sweny-ai/cli triage --help
+npx @sweny-ai/core --help
 ```
 
-## Prerequisites
+:::note[Prerequisites]
+SWEny uses [Claude](https://claude.ai/) as its AI engine. You'll need an Anthropic API key (`ANTHROPIC_API_KEY`), OAuth token (`CLAUDE_CODE_OAUTH_TOKEN`), or authenticated Claude Code instance. If both keys are set, the OAuth token takes precedence. The runtime is installed automatically.
+:::
 
-- A Claude Max subscription or Anthropic API key
+## Build your first workflow
 
-The coding agent CLI (Claude Code by default) is installed automatically when you run the workflow — no manual pre-installation needed.
+**1. Add your API key to `.env`:**
 
-## Try it in 60 seconds (local-only mode)
+```bash
+# .env (gitignored)
+ANTHROPIC_API_KEY=sk-ant-...
+```
 
-No external services needed — just an LLM API key and a log file:
+The CLI auto-loads `.env` at startup -- no external dotenv tooling required.
+
+**2. Create a workflow from a description:**
+
+```bash
+sweny workflow create "analyze our codebase for common security \
+  anti-patterns, compile a report, and create tickets for critical findings"
+```
+
+SWEny generates a full workflow with nodes, conditional routing, and structured output schemas. It renders an ASCII DAG and prompts you to save, refine, or discard:
+
+```
+  Save to .sweny/workflows/security_audit.yml? [Y/n/refine]
+```
+
+Type a refinement instruction to iterate on the design, or press `Y` to save.
+
+**3. Run it:**
+
+```bash
+sweny workflow run .sweny/workflows/security_audit.yml
+```
+
+**4. Refine it later:**
+
+```bash
+sweny workflow edit .sweny/workflows/security_audit.yml \
+  "add a quality gate that rejects vague findings"
+```
+
+That's it. No YAML to write by hand, no boilerplate to configure.
+
+## Try the built-in triage workflow
+
+SWEny also ships production-ready workflows for SRE triage. No external services needed for a quick test -- just an API key and a log file.
+
+**1. Create a config file:**
+
+```bash
+sweny new
+```
+
+This runs the interactive picker and writes a starter `.sweny.yml`. Uncomment the local-only block:
 
 ```yaml
 # .sweny.yml
@@ -36,58 +83,50 @@ source-control-provider: file
 notification-provider: file
 ```
 
-```bash
-# .env
-ANTHROPIC_API_KEY=sk-ant-...
-```
-
-```bash
-npx @sweny-ai/cli triage --dry-run
-```
-
-Output goes to `.sweny/output/`:
-- `issues/LOCAL-1.md` — Linear-style issue tickets
-- `prs/pr-1.md` — GitHub-style PR descriptions
-- `notifications/summary-*.md` — run summaries
-
-When you're ready, swap in real providers (Datadog, GitHub, Linear, etc.) — the workflow is identical.
-
-## Quick start
-
-**1. Create a config file:**
-
-```bash
-sweny init
-```
-
-This creates `.sweny.yml` with all available options commented out. Uncomment and edit what you need:
-
-```yaml
-# .sweny.yml — commit this file. Secrets go in .env (gitignored).
-observability-provider: file
-log-file: ./logs/errors.json
-```
-
-**2. Add secrets to `.env`:**
-
-```bash
-# .env
-CLAUDE_CODE_OAUTH_TOKEN=your-token
-```
-
-The CLI auto-loads `.env` at startup — no external tools needed.
-
-**3. Run a dry-run triage:**
+**2. Run a dry-run triage:**
 
 ```bash
 sweny triage --dry-run
 ```
 
-SWEny reads settings from `.sweny.yml`, loads secrets from `.env`, analyzes your logs, and prints a full investigation report — without creating any issues or PRs.
+SWEny reads `.sweny.yml`, loads secrets from `.env`, analyzes your logs, and writes results to `.sweny/output/` without creating any real issues or PRs.
 
-### Config priority
+## Live progress display
 
-Settings are resolved in this order (highest wins):
+When running on an interactive terminal, the CLI renders a live progress display that updates in place as each node executes:
+
+```
+  ⠹ [2/5] Investigate errors  1m 42s
+    ↳ Calling sentry.list_issues
+    ↳ Calling github.search_code
+    ↳ Analyzing stack traces
+```
+
+The progress block shows a spinner, step counter, node name, and elapsed time. Below it, the last few activity messages stream in as the agent works. When a node finishes, the block is replaced with a completion line:
+
+```
+  ✓ [1/5] Fetch errors  12s
+    ↳ Found 3 unresolved issues
+  ✓ [2/5] Investigate errors  2m 14s
+    ↳ Root cause identified in webhook handler
+  ⠹ [3/5] Create issues  4s
+```
+
+Non-TTY environments (CI, pipes) get simple periodic status lines instead of animated output.
+
+### NDJSON streaming
+
+Pass `--stream` to emit raw `ExecutionEvent` objects as newline-delimited JSON to stdout. This is how Studio's Live Mode connects to a running workflow:
+
+```bash
+sweny triage --stream | studio-consumer
+```
+
+`--stream` can be combined with the normal progress display — structured events go to stdout while the spinner renders to stderr.
+
+## Config priority
+
+Settings resolve in this order (highest wins):
 
 ```
 CLI flag  >  environment variable  >  .sweny.yml  >  default
@@ -101,10 +140,10 @@ sweny triage --dry-run --time-range 1h --service-filter 'billing-*'
 
 ## Config file reference
 
-`.sweny.yml` uses flat kebab-case keys that match CLI flags 1:1. You can copy any flag from `--help` directly into the YAML:
+`.sweny.yml` uses flat kebab-case keys that map 1:1 to CLI flags. You can copy any flag from `--help` directly into the YAML:
 
 ```yaml
-# .sweny.yml
+# .sweny.yml -- commit this file. Secrets go in .env.
 
 # Providers
 observability-provider: datadog
@@ -130,108 +169,40 @@ log-file: ./logs/errors.json
 # Cache
 cache-dir: .sweny/cache
 cache-ttl: 86400
+```
 
-# Provider-specific (non-secret)
-dd-site: datadoghq.com
+Secrets (API keys, tokens) are never read from the config file -- always use environment variables or `.env`.
+
+## Connecting providers
+
+Once local-only mode works, swap in real providers. Set the provider in `.sweny.yml` and add credentials to `.env`:
+
+```yaml
+# .sweny.yml
+observability-provider: sentry
 sentry-org: my-org
 sentry-project: my-project
-linear-team-id: your-team-uuid
-```
-
-Secrets (API keys, tokens) are **never** read from the config file — always use environment variables or `.env`.
-
-## Connecting to your observability platform
-
-Once you're comfortable with the output, point SWEny at your real logs. Set the provider in `.sweny.yml`:
-
-```yaml
-observability-provider: datadog
-```
-
-And add the credentials to `.env`:
-
-```bash
-# .env
-DD_API_KEY=your-api-key
-DD_APP_KEY=your-app-key
-```
-
-```bash
-sweny triage --dry-run
-```
-
-See [Observability Providers](/providers/observability/) for all supported platforms and their required credentials.
-
-## Creating issues and PRs
-
-Remove `--dry-run` and add a `GITHUB_TOKEN` to let SWEny create issues and open fix PRs:
-
-```bash
-# .env
-GITHUB_TOKEN=ghp_...
-```
-
-```bash
-sweny triage
-```
-
-For Linear or Jira instead of GitHub Issues, set the provider in `.sweny.yml`:
-
-```yaml
-# Linear
 issue-tracker-provider: linear
 linear-team-id: your-team-uuid
 ```
 
-```yaml
-# Jira
-issue-tracker-provider: jira
-```
-
-And add the credentials to `.env`:
-
 ```bash
-# Linear
+# .env
+SENTRY_AUTH_TOKEN=sntrys_...
 LINEAR_API_KEY=lin_api_...
-
-# Jira
-JIRA_BASE_URL=https://mycompany.atlassian.net
-JIRA_EMAIL=bot@mycompany.com
-JIRA_API_TOKEN=your-token
+GITHUB_TOKEN=ghp_...
 ```
 
-## Step caching
-
-The CLI caches successful step results to disk. If the workflow crashes or you cancel mid-run, re-running replays cached steps instantly instead of re-executing expensive operations like `investigate` (which can take 3+ minutes):
-
-```
-First run:
-  ✓ [3/9] investigate         3m 6s   → result cached
-
-Re-run (same config):
-  ↻ [3/9] investigate         cached  → replayed from disk
-```
-
-Cache is keyed on your config — changing providers, time range, or other settings produces a fresh cache. Caching is enabled by default.
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--cache-dir` | Cache directory | `.sweny/cache` |
-| `--cache-ttl` | TTL in seconds (0 = infinite) | `86400` (24h) |
-| `--no-cache` | Disable caching entirely | — |
-
-You can also set `cache-dir` and `cache-ttl` in `.sweny.yml`.
-
-## JSON output
-
-Use `--json` for machine-readable output — useful for piping to other tools or scripting:
+Verify credentials before running a full workflow:
 
 ```bash
-sweny triage --dry-run --json | jq '.status'
+sweny check
 ```
+
+See the [Commands Reference](/cli/commands/) for all supported providers and their options.
 
 ## What's next?
 
-- [CLI Inputs](/cli/inputs/) — full reference for all flags and environment variables
-- [CLI Examples](/cli/examples/) — common configurations and recipes
-- [Action Inputs](/action/inputs/) — equivalent GitHub Action configuration (the CLI mirrors these)
+- [E2E Testing](/cli/e2e/) -- generate and run AI-driven browser tests
+- [Commands Reference](/cli/commands/) -- every command, flag, and option
+- [Examples](/cli/examples/) -- common configurations and real-world workflows

@@ -1,50 +1,57 @@
 {
   "name": "@sweny-ai/studio",
-  "version": "2.0.0",
+  "version": "8.0.27",
   "type": "module",
-  "exports": {
-    "./viewer": {
-      "import": "./dist-lib/viewer.js",
-      "types": "./dist-lib/types/lib-viewer.d.ts"
-    },
-    "./editor": {
-      "import": "./dist-lib/editor.js",
-      "types": "./dist-lib/types/lib-editor.d.ts"
-    },
-    "./style.css": "./dist-lib/style.css"
+  "engines": {
+    "node": ">=20"
   },
   "files": [
-    "dist-lib"
+    "dist/lib"
   ],
-  "sideEffects": [
-    "dist-lib/style.css"
-  ],
+  "exports": {
+    ".": {
+      "import": "./dist/lib/viewer.js",
+      "types": "./dist/lib/types/lib-viewer.d.ts"
+    },
+    "./viewer": {
+      "import": "./dist/lib/viewer.js",
+      "types": "./dist/lib/types/lib-viewer.d.ts"
+    },
+    "./editor": {
+      "import": "./dist/lib/editor.js",
+      "types": "./dist/lib/types/lib-editor.d.ts"
+    },
+    "./style.css": "./dist/lib/style.css"
+  },
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
-    "build:lib": "vite build --config vite.lib.config.ts && tsc -p tsconfig.lib.json",
+    "build:lib": "BUILD_MODE=lib vite build && tsc --project tsconfig.lib.json",
     "typecheck": "tsc --noEmit"
   },
-  "peerDependencies": {
-    "@sweny-ai/engine": "*",
-    "react": "^18.3.0",
-    "react-dom": "^18.3.0"
-  },
   "dependencies": {
-    "@xyflow/react": "^12.0.0",
+    "@sweny-ai/core": "*",
+    "@xyflow/react": "^12.11.2",
     "elkjs": "^0.9.0",
-    "immer": "^11.1.4",
-    "zustand": "^4.3.0",
-    "zundo": "^2.3.0"
+    "immer": "^11.1.15",
+    "yaml": "^2.9.0",
+    "zundo": "^2.3.0",
+    "zustand": "^4.5.7"
   },
   "devDependencies": {
-    "@types/react": "^18.3.0",
-    "@types/react-dom": "^18.3.0",
-    "@vitejs/plugin-react": "^4.0.0",
-    "autoprefixer": "^10.4.0",
-    "postcss": "^8.5.8",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^5.2.0",
+    "autoprefixer": "^10.5.4",
+    "postcss": "^8.5.23",
     "tailwindcss": "^3.4.0",
     "typescript": "^5.5.0",
-    "vite": "^5.0.0"
+    "vite": "^8.1.5"
+  },
+  "peerDependencies": {
+    "react": "^18.0.0 || ^19.0.0",
+    "react-dom": "^18.0.0 || ^19.0.0",
+    "@xyflow/react": "^12.11.2",
+    "elkjs": "^0.9.0"
   }
 }

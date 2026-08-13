@@ -1,0 +1,690 @@
+/**
+ * Tests for YAML-based built-in workflows.
+ *
+ * Validates that the YAML files are correctly loaded, structurally valid,
+ * match the Workflow type, and that the browser bundle is consistent.
+ */
+import { describe, it, expect } from "vitest";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
+import { parse as parseYaml } from "yaml";
+
+import { triageWorkflow, implementWorkflow, seedContentWorkflow } from "../workflows/index.js";
+import { validateWorkflow, workflowZ } from "../schema.js";
+import type { Workflow } from "../types.js";
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const workflowDir = path.join(__dirname, "..", "workflows");
+
+// ─── YAML file existence & parsing ──────────────────────────────
+
+describe("workflow YAML files", () => {
+  const yamlFiles = ["triage.yml", "implement.yml", "seed-content.yml"];
+
+  for (const file of yamlFiles) {
+    it(`${file} exists on disk`, () => {
+      const filePath = path.join(workflowDir, file);
+      expect(fs.existsSync(filePath)).toBe(true);
+    });
+
+    it(`${file} is valid YAML`, () => {
+      const content = fs.readFileSync(path.join(workflowDir, file), "utf-8");
+      expect(() => parseYaml(content)).not.toThrow();
+    });
+
+    it(`${file} parses to an object with required Workflow fields`, () => {
+      const content = fs.readFileSync(path.join(workflowDir, file), "utf-8");
+      const data = parseYaml(content) as Record<string, unknown>;
+      expect(data).toHaveProperty("id");
+      expect(data).toHaveProperty("name");
+      expect(data).toHaveProperty("entry");
+      expect(data).toHaveProperty("nodes");
+      expect(data).toHaveProperty("edges");
+      expect(typeof data.id).toBe("string");
+      expect(typeof data.name).toBe("string");
+      expect(typeof data.entry).toBe("string");
+      expect(typeof data.nodes).toBe("object");
+      expect(Array.isArray(data.edges)).toBe(true);
+    });
+
+    it(`${file} passes Zod schema validation`, () => {
+      const content = fs.readFileSync(path.join(workflowDir, file), "utf-8");
+      const data = parseYaml(content);
+      expect(() => workflowZ.parse(data)).not.toThrow();
+    });
+  }
+});
+
+// ─── Loaded workflow objects ────────────────────────────────────
+
+describe("loaded workflow objects", () => {
+  const workflows: [string, Workflow][] = [
+    ["triage", triageWorkflow],
+    ["implement", implementWorkflow],
+    ["seed-content", seedContentWorkflow],
+  ];
+
+  for (const [name, workflow] of workflows) {
+    describe(name, () => {
+      it("has correct id", () => {
+        expect(workflow.id).toBe(name);
+      });
+
+      it("has a non-empty name", () => {
+        expect(workflow.name.length).toBeGreaterThan(0);
+      });
+
+      it("entry node exists in nodes", () => {
+        expect(workflow.nodes).toHaveProperty(workflow.entry);
+      });
+
+      it("passes structural validation (no cycles, all reachable)", () => {
+        const errors = validateWorkflow(workflow);
+        expect(errors).toEqual([]);
+      });
+
+      it("every node has a non-empty instruction", () => {
+        for (const [nodeId, node] of Object.entries(workflow.nodes)) {
+          const instr = node.instruction;
+          if (typeof instr === "string") {
+            expect(instr.length, `node "${nodeId}" has empty instruction`).toBeGreaterThan(0);
+          } else {
+            // Object-form Source — always truthy if it exists
+            expect(instr, `node "${nodeId}" has falsy instruction`).toBeTruthy();
+          }
+        }
+      });
+
+      it("every node has a name", () => {
+        for (const [nodeId, node] of Object.entries(workflow.nodes)) {
+          expect(node.name.length, `node "${nodeId}" has empty name`).toBeGreaterThan(0);
+        }
+      });
+
+      it("all edge sources reference existing nodes", () => {
+        const nodeIds = new Set(Object.keys(workflow.nodes));
+        for (const edge of workflow.edges) {
+          expect(nodeIds.has(edge.from), `edge source "${edge.from}" not in nodes`).toBe(true);
+        }
+      });
+
+      it("all edge targets reference existing nodes", () => {
+        const nodeIds = new Set(Object.keys(workflow.nodes));
+        for (const edge of workflow.edges) {
+          expect(nodeIds.has(edge.to), `edge target "${edge.to}" not in nodes`).toBe(true);
+        }
+      });
+
+      it("has no self-loops", () => {
+        for (const edge of workflow.edges) {
+          expect(edge.from, `self-loop on "${edge.from}"`).not.toBe(edge.to);
+        }
+      });
+
+      it("all non-terminal nodes have at least one outgoing edge", () => {
+        const nodeIds = Object.keys(workflow.nodes);
+        const nodesWithOutgoing = new Set(workflow.edges.map((e) => e.from));
+        const terminalNodes = nodeIds.filter((id) => !nodesWithOutgoing.has(id));
+        // Terminal nodes are fine (they're leaf nodes), but there should be at least one
+        // non-terminal node unless it's a single-node workflow
+        if (nodeIds.length > 1) {
+          expect(nodesWithOutgoing.size).toBeGreaterThan(0);
+        }
+      });
+    });
+  }
+});
+
+// ─── Triage workflow specifics ──────────────────────────────────
+
+describe("triage workflow specifics", () => {
+  it("has 7 nodes", () => {
+    expect(Object.keys(triageWorkflow.nodes).length).toBe(7);
+  });
+
+  it("starts at gather", () => {
+    expect(triageWorkflow.entry).toBe("gather");
+  });
+
+  it("has conditional edges from investigate", () => {
+    const investigateEdges = triageWorkflow.edges.filter((e) => e.from === "investigate");
+    expect(investigateEdges.length).toBe(2);
+    expect(investigateEdges.every((e) => e.when)).toBe(true);
+  });
+
+  it("notify is reachable from all branches", () => {
+    const toNotify = triageWorkflow.edges.filter((e) => e.to === "notify");
+    expect(toNotify.length).toBeGreaterThanOrEqual(3);
+  });
+
+  it("investigate node has structured output schema", () => {
+    expect(triageWorkflow.nodes.investigate.output).toBeDefined();
+    expect(triageWorkflow.nodes.investigate.output!.type).toBe("object");
+    expect(triageWorkflow.nodes.investigate.output!.required).toContain("findings");
+  });
+});
+
+// ─── Triage `implement` node contract ───────────────────────────
+//
+// The implement node is the one that ships code. Its instruction text and
+// verify gate are what stops the agent from shipping a fix without tests.
+// Regressions here are silent and expensive — a fix lands on main without
+// coverage and the agent's quality bar quietly drops. So pin every load-
+// bearing piece of the contract: instruction shape, output schema, verify
+// rule, retry block. Includes one explicit "known limitation" test that
+// documents the pass-with-empty-tests escape hole so a future fix doesn't
+// quietly close it without us noticing.
+
+describe("triage implement node — fix-quality contract", () => {
+  const node = triageWorkflow.nodes.implement;
+
+  describe("instruction text", () => {
+    const instruction = node.instruction as string;
+
+    it("is a string source (not an external file ref)", () => {
+      // Inline instruction is intentional — keeps the contract auditable
+      // in this test file via simple substring assertions.
+      expect(typeof instruction).toBe("string");
+    });
+
+    it("declares a Quality Bar covering the five Nate requirements", () => {
+      // Each axis in the Quality Bar maps to a value in the user's
+      // directive: correctness, completeness, industry-standard, no hacky
+      // shortcuts, well-tested. A fix that drops any one is incomplete.
+      expect(instruction).toMatch(/Quality bar/i);
+      expect(instruction).toMatch(/Correctness/);
+      expect(instruction).toMatch(/Completeness/);
+      expect(instruction).toMatch(/Idiomatic/);
+      expect(instruction).toMatch(/No hacky shortcuts/);
+      expect(instruction).toMatch(/Well-tested/);
+    });
+
+    it("requires reading the nearest existing test file before writing tests", () => {
+      // Without this the agent picks an arbitrary test framework /
+      // mocking style that diverges from the repo's conventions, which
+      // is the most common form of "test exists but doesn't fit."
+      expect(instruction).toMatch(/nearest existing test file/);
+    });
+
+    it("requires tests that would fail on the unfixed code", () => {
+      // A test that passes both before AND after the fix is decoration,
+      // not a regression guard. This is the load-bearing distinction
+      // between "wrote tests" and "wrote regression coverage."
+      expect(instruction).toMatch(/fail on the unfixed code/i);
+    });
+
+    it("requires tests that assert the user-facing contract, not implementation detail", () => {
+      expect(instruction).toMatch(/user-facing contract/);
+    });
+
+    it("frames idiom examples as illustrations (multiple stacks, not a single dictate)", () => {
+      // Earlier draft (PR #168) cited NestJS exception subclasses as if they
+      // were the rule. That biased the agent toward web-backend stacks. The
+      // softened version (PR #169) shows NestJS, Go, and TypeScript as
+      // equal-weight illustrations. Lock that in so a future revision
+      // doesn't accidentally narrow the framing again.
+      expect(instruction).toMatch(/NestJS/);
+      expect(instruction).toMatch(/Go/);
+      expect(instruction).toMatch(/TypeScript/);
+      expect(instruction).toMatch(/illustrations/i);
+      // YAML `|-` block scalar preserves newlines mid-sentence, so allow
+      // whitespace (including \n + indent) inside the phrase.
+      expect(instruction).toMatch(/whatever the repo already does,\s+keep doing/i);
+    });
+  });
+
+  describe("output schema", () => {
+    const output = node.output;
+
+    it("declares an object schema", () => {
+      expect(output).toBeDefined();
+      expect(output!.type).toBe("object");
+    });
+
+    it("requires the fix-tracking fields the eval gate depends on", () => {
+      const required = output!.required as string[];
+      // These are the fields the agent MUST report. Removing any of them
+      // breaks the eval contract or makes audit impossible.
+      expect(required).toContain("branch");
+      expect(required).toContain("commit_sha");
+      expect(required).toContain("files_changed");
+      expect(required).toContain("test_files_changed");
+      expect(required).toContain("test_status");
+    });
+
+    it("declares test_status with exactly the five allowed values", () => {
+      const props = output!.properties as Record<string, any>;
+      expect(props.test_status).toBeDefined();
+      // Order doesn't matter; set semantics for the enum.
+      // `skipped` was added to support the Step 0b open-PR precondition —
+      // when an open PR already exists for the issue identifier, implement
+      // short-circuits without running tests and the workflow routes to
+      // notify. See triage.yml implement instruction Step 0b.
+      expect(new Set(props.test_status.enum)).toEqual(new Set(["pass", "fail", "no-framework", "not-run", "skipped"]));
+    });
+
+    it("declares skipped_reason as an enum scoped to documented reasons", () => {
+      const props = output!.properties as Record<string, any>;
+      expect(props.skipped_reason).toBeDefined();
+      // Currently the only valid skip reason is open-pr-exists. Keeping
+      // this enum tight prevents drive-by additions; new reasons should
+      // come with a documented rationale and edge wiring.
+      expect(new Set(props.skipped_reason.enum)).toEqual(new Set(["open-pr-exists"]));
+    });
+
+    it("declares existing_pr_url as a URL string", () => {
+      const props = output!.properties as Record<string, any>;
+      expect(props.existing_pr_url).toBeDefined();
+      expect(props.existing_pr_url.type).toBe("string");
+      // Pattern guards against bare PR numbers or local paths.
+      expect(props.existing_pr_url.pattern).toBe("^https?://");
+    });
+
+    it("declares test_files_changed as an array of strings", () => {
+      const props = output!.properties as Record<string, any>;
+      expect(props.test_files_changed.type).toBe("array");
+      expect(props.test_files_changed.items.type).toBe("string");
+    });
+  });
+
+  describe("eval gate", () => {
+    const evaluators = node.eval;
+
+    it("declares a value evaluator with output_matches on test_status", () => {
+      expect(evaluators).toBeDefined();
+      const ev = evaluators!.find((e) => e.kind === "value" && e.rule?.output_matches !== undefined);
+      expect(ev).toBeDefined();
+      const match = ev!.rule!.output_matches!.find((m) => m.path === "test_status");
+      expect(match).toBeDefined();
+    });
+
+    it("allows pass, no-framework, and skipped, and only those three", () => {
+      const ev = evaluators!.find((e) => e.kind === "value" && e.rule?.output_matches !== undefined)!;
+      const match = ev.rule!.output_matches!.find((m) => m.path === "test_status")!;
+      // Behavior contract: pass is the happy path; no-framework is the
+      // documented escape valve for genuinely test-less repos; skipped is
+      // the Step 0b open-PR precondition that prevents the run-thrash
+      // observed in letsoffload/permit-service #81 → #82 and
+      // letsoffload/offload #572 → #573. Anything else (fail, not-run)
+      // trips the gate and triggers retry.
+      expect(new Set(match.in as string[])).toEqual(new Set(["pass", "no-framework", "skipped"]));
+    });
+  });
+
+  describe("retry block", () => {
+    const retry = node.retry;
+
+    it("is configured with max=1 and auto reflection", () => {
+      // One retry is the right shape: enough to recover from an honest
+      // forget-the-tests, not so many that we burn a whole turn budget
+      // on an agent that's already off the rails.
+      expect(retry).toBeDefined();
+      expect(retry!.max).toBe(1);
+      expect(retry!.instruction).toEqual({ auto: true });
+    });
+  });
+
+  describe("test_files_changed contract: judge closes the gap", () => {
+    // The contract: if test_status is "pass", test_files_changed MUST be
+    // non-empty. Value/function evaluators can't express "A AND (B implies
+    // C)" declaratively. A judge evaluator absorbs the conditional.
+    //
+    // Driving incident: PR #366, where triage shipped a NestJS fix to
+    // letsoffload/offload without writing tests, even though *.spec.ts
+    // already existed.
+    it("declares a judge evaluator that names test_files_changed", () => {
+      const evaluators = node.eval ?? [];
+      const judges = evaluators.filter((e) => e.kind === "judge");
+      expect(judges.length).toBeGreaterThan(0);
+
+      const testFilesJudge = judges.find((e) => (e.rubric ?? "").includes("test_files_changed"));
+      expect(testFilesJudge).toBeDefined();
+      expect(testFilesJudge!.rubric).toMatch(/test_status/);
+      expect(testFilesJudge!.pass_when).toBe("yes");
+    });
+
+    it("keeps the value evaluator that gates on test_status", () => {
+      const evaluators = node.eval ?? [];
+      const valueEvs = evaluators.filter((e) => e.kind === "value");
+      const testStatusMatches = valueEvs.flatMap(
+        (e) => e.rule?.output_matches?.filter((m) => m.path === "test_status") ?? [],
+      );
+      expect(testStatusMatches.length).toBeGreaterThan(0);
+      const allowedStatuses = testStatusMatches[0]!.in as string[];
+      expect(new Set(allowedStatuses)).toEqual(new Set(["pass", "no-framework", "skipped"]));
+    });
+
+    it("retains a single retry attempt with autonomous reflection", () => {
+      // The judge can fail spuriously; one retry with reflection lets the
+      // agent recover from a genuine forget-the-tests miss.
+      expect(node.retry).toBeDefined();
+      expect(node.retry!.max).toBe(1);
+      expect(node.retry!.instruction).toEqual({ auto: true });
+    });
+  });
+});
+
+// ─── Triage implement-node open-PR precondition (Step 0b) ───────
+//
+// Driving incident: in a single SWEny workflow run on 2026-04-26
+// (letsoffload/permit-service, run id 24958851295), PR #81 was opened
+// at 14:32:58, closed by github-actions[bot] at 14:47:57, and PR #82
+// was opened 12 seconds later — both for OFF-1481, different fix
+// approaches. Same pattern on 2026-05-11 in letsoffload/offload
+// (run id 25678132232): #572 closed and #573 opened 16 seconds apart
+// for OFF-1768. Cause: the implement node has no idempotency guard;
+// re-runs (and internal retries) re-implement a fix that already has
+// an open PR, then ad-hoc close the prior PR to land the new one.
+// The Step 0b check short-circuits before any branch is created.
+describe("triage implement node — Step 0b open-PR precondition", () => {
+  const node = triageWorkflow.nodes.implement;
+  const instruction = node.instruction as string;
+
+  it("instruction documents Step 0b PR-existence check", () => {
+    expect(instruction).toMatch(/Step 0b|0b\.|Precondition.*existing open PR/i);
+    // Must reference an actual tool the github skill exposes. `github_search_issues`
+    // hits GitHub's /search/issues endpoint which returns PRs too when filtered
+    // with `type:pr`. There is no `github_search_prs` tool; referencing it would
+    // tell the agent to call a non-existent function.
+    expect(instruction).toMatch(/github_search_issues/);
+    expect(instruction).not.toMatch(/github_search_prs/);
+    expect(instruction).toMatch(/type:pr/);
+    expect(instruction).toMatch(/state:open/);
+  });
+
+  it("instruction tells the agent to STOP without creating a branch when an open PR exists", () => {
+    // The whole point of the precondition: no new branch, no new commit,
+    // no new PR. Pin the prohibition explicitly so a future "improvement"
+    // doesn't relax it back to "but if the title is slightly different..."
+    expect(instruction).toMatch(/STOP\.\s+Do\s+NOT create a branch/);
+  });
+
+  it("instruction prescribes the exact skipped-output shape", () => {
+    expect(instruction).toMatch(/test_status:\s*"skipped"/);
+    expect(instruction).toMatch(/skipped_reason:\s*"open-pr-exists"/);
+    expect(instruction).toMatch(/existing_pr_url/);
+  });
+
+  it("cites the driving incidents so the rationale survives future edits", () => {
+    // These are not flair — they are the specific evidence the precondition
+    // is for. Stripping the citation invites a future contributor to
+    // remove the precondition as "unmotivated."
+    expect(instruction).toMatch(/permit-service.*PR #81/);
+    expect(instruction).toMatch(/offload.*PR #572/);
+  });
+
+  it("has an edge from implement to notify gated on test_status skipped", () => {
+    const implementToNotify = triageWorkflow.edges.find((e) => e.from === "implement" && e.to === "notify");
+    expect(implementToNotify).toBeDefined();
+    expect(implementToNotify!.when).toBeDefined();
+    expect(implementToNotify!.when!).toMatch(/skipped/);
+  });
+
+  it("the implement→create_pr edge is now conditional, not unconditional", () => {
+    // Before this fix, implement→create_pr had no `when:` and always fired,
+    // which is what made the skipped path unrouteable. Make sure the edge
+    // stays conditional so the engine can choose between create_pr and
+    // notify based on the implement node's output.
+    const implementToCreatePr = triageWorkflow.edges.find((e) => e.from === "implement" && e.to === "create_pr");
+    expect(implementToCreatePr).toBeDefined();
+    expect(implementToCreatePr!.when).toBeDefined();
+    expect(implementToCreatePr!.when!).toMatch(/pass|no-framework/);
+  });
+
+  it("the judge rubric still covers the skipped case", () => {
+    const evaluators = node.eval ?? [];
+    const judges = evaluators.filter((e) => e.kind === "judge");
+    const testFilesJudge = judges.find((e) => (e.rubric ?? "").includes("test_files_changed"));
+    expect(testFilesJudge).toBeDefined();
+    // The rubric must explicitly allow empty test_files_changed when
+    // test_status is "skipped" — otherwise the judge fails the contract
+    // on the Step 0b short-circuit and burns the retry budget.
+    expect(testFilesJudge!.rubric).toMatch(/"skipped"/);
+  });
+
+  it("fail and not-run still trigger retry (NOT added to the allow-list)", () => {
+    // Adding `skipped` to the value gate must not inadvertently relax the
+    // gate for `fail` or `not-run`. Both should remain outside `in` so the
+    // retry path keeps firing on real test failures.
+    const evaluators = node.eval ?? [];
+    const valueEv = evaluators.find((e) => e.kind === "value" && e.rule?.output_matches !== undefined)!;
+    const match = valueEv.rule!.output_matches!.find((m) => m.path === "test_status")!;
+    const allowed = match.in as string[];
+    expect(allowed).not.toContain("fail");
+    expect(allowed).not.toContain("not-run");
+  });
+});
+
+// ─── Implement workflow specifics ───────────────────────────────
+
+describe("implement workflow specifics", () => {
+  it("has 5 nodes", () => {
+    expect(Object.keys(implementWorkflow.nodes).length).toBe(5);
+  });
+
+  it("starts at analyze", () => {
+    expect(implementWorkflow.entry).toBe("analyze");
+  });
+
+  it("has three conditional edges from analyze (existing PR, fix, skip)", () => {
+    // analyze now branches three ways:
+    //   1. existing_pr_url is set → notify (no work to do)
+    //   2. risk low/medium with a clear plan → implement
+    //   3. too complex/risky/unclear → skip
+    const analyzeEdges = implementWorkflow.edges.filter((e) => e.from === "analyze");
+    expect(analyzeEdges.length).toBe(3);
+    expect(analyzeEdges.every((e) => e.when)).toBe(true);
+  });
+
+  it("analyze → notify edge mentions existing_pr_url", () => {
+    const analyzeToNotify = implementWorkflow.edges.find((e) => e.from === "analyze" && e.to === "notify");
+    expect(analyzeToNotify).toBeDefined();
+    expect(analyzeToNotify!.when!).toMatch(/existing_pr_url/);
+  });
+
+  it("analyze node instruction mentions the PR-existence check", () => {
+    const instr = implementWorkflow.nodes.analyze.instruction as string;
+    // Must reference a tool the github skill actually exposes — there is
+    // no `github_search_prs`. `github_search_issues` covers PRs via the
+    // /search/issues endpoint with a `type:pr` qualifier.
+    expect(instr).toMatch(/github_search_issues/);
+    expect(instr).not.toMatch(/github_search_prs/);
+    expect(instr).toMatch(/type:pr/);
+    expect(instr).toMatch(/existing open PR|open PR.*already exists/i);
+  });
+
+  it("analyze output schema declares existing_pr_url as a URL string", () => {
+    const props = implementWorkflow.nodes.analyze.output!.properties as Record<string, any>;
+    expect(props.existing_pr_url).toBeDefined();
+    expect(props.existing_pr_url.type).toBe("string");
+    expect(props.existing_pr_url.pattern).toBe("^https?://");
+  });
+
+  it("skip routes to notify (team always gets notified)", () => {
+    const skipToNotify = implementWorkflow.edges.find((e) => e.from === "skip" && e.to === "notify");
+    expect(skipToNotify).toBeDefined();
+  });
+
+  it("analyze node has structured output schema", () => {
+    expect(implementWorkflow.nodes.analyze.output).toBeDefined();
+    expect(implementWorkflow.nodes.analyze.output!.type).toBe("object");
+  });
+});
+
+// ─── Browser bundle consistency ─────────────────────────────────
+
+describe("browser bundle", () => {
+  const browserPath = path.join(__dirname, "..", "..", "dist", "workflows", "browser.js");
+
+  it("exists in dist", () => {
+    expect(fs.existsSync(browserPath)).toBe(true);
+  });
+
+  it("triage workflow is deeply equal", async () => {
+    const browser = await import(browserPath);
+    expect(browser.triageWorkflow).toEqual(JSON.parse(JSON.stringify(triageWorkflow)));
+  });
+
+  it("implement workflow is deeply equal", async () => {
+    const browser = await import(browserPath);
+    expect(browser.implementWorkflow).toEqual(JSON.parse(JSON.stringify(implementWorkflow)));
+  });
+
+  it("seed-content workflow is deeply equal", async () => {
+    const browser = await import(browserPath);
+    expect(browser.seedContentWorkflow).toEqual(JSON.parse(JSON.stringify(seedContentWorkflow)));
+  });
+
+  it("exports exactly the expected workflow names", async () => {
+    const browser = await import(browserPath);
+    const exportedKeys = Object.keys(browser).sort();
+    expect(exportedKeys).toEqual(["implementWorkflow", "seedContentWorkflow", "triageWorkflow"]);
+  });
+});
+
+// ─── Zod runtime validation ─────────────────────────────────────
+
+describe("runtime Zod validation in loader", () => {
+  it("workflows are Zod-validated at load time (not just cast)", () => {
+    // The loader uses workflowZ.parse(), so invalid YAML would throw at import.
+    // If we got here, all 3 workflows passed Zod validation at module load.
+    // Verify by checking the parsed output has Zod's default-applied fields.
+    expect(triageWorkflow.description).toBeDefined();
+    expect(implementWorkflow.description).toBeDefined();
+    expect(seedContentWorkflow.description).toBeDefined();
+
+    // Zod applies .default([]) to skills arrays — verify it works
+    for (const node of Object.values(triageWorkflow.nodes)) {
+      expect(Array.isArray(node.skills)).toBe(true);
+    }
+  });
+});
+
+// ─── Triage gather node: read-only scope enforcement ────────────
+// Driving incident: the 2026-06-08 letsoffload/permit-service scheduled run,
+// where gather created Linear issues OFF-2332/OFF-2333 and PRs #101/#102
+// from inside the gather node and then died at the 50-turn cap.
+
+describe("triage gather node: read-only scope enforcement", () => {
+  const gather = triageWorkflow.nodes.gather;
+
+  it("denies every issue/PR/comment write tool from its skills", () => {
+    expect(gather.tools).toBeDefined();
+    expect(gather.tools!.deny).toEqual(
+      expect.arrayContaining([
+        "linear_create_issue",
+        "linear_add_comment",
+        "linear_update_issue",
+        "github_create_issue",
+        "github_add_comment",
+        "github_create_pr",
+      ]),
+    );
+  });
+
+  it("does not declare an allow list (deny-only keeps new read tools available)", () => {
+    expect(gather.tools!.allow).toBeUndefined();
+  });
+
+  it("disallows the built-in file-editing tools (no code authoring mid-gather)", () => {
+    expect(gather.disallowed_tools).toEqual(expect.arrayContaining(["Write", "Edit", "NotebookEdit"]));
+  });
+
+  it("is fail-soft: a turn-cap death proceeds with partial context", () => {
+    expect(gather.fail_soft).toBe(true);
+  });
+
+  it("instruction declares the read-only scope boundary", () => {
+    const instr = gather.instruction as string;
+    expect(instr).toMatch(/READ-ONLY/);
+    expect(instr).toMatch(/DO NOT create issues, comments, branches, commits, or pull requests/);
+  });
+
+  it("instruction no longer invites using every tool available", () => {
+    const instr = gather.instruction as string;
+    expect(instr).not.toMatch(/Use every tool available/i);
+  });
+
+  it("downstream write nodes keep their write tools", () => {
+    // create_issue must still be able to create issues and comment.
+    const createIssueDeny = triageWorkflow.nodes.create_issue.tools?.deny ?? [];
+    expect(createIssueDeny).not.toContain("linear_create_issue");
+    expect(createIssueDeny).not.toContain("linear_add_comment");
+    // but never PRs
+    expect(createIssueDeny).toContain("github_create_pr");
+
+    // create_pr must still be able to open PRs.
+    const createPrDeny = triageWorkflow.nodes.create_pr.tools?.deny ?? [];
+    expect(createPrDeny).not.toContain("github_create_pr");
+
+    // skip must still be able to +1 and reopen.
+    const skipDeny = triageWorkflow.nodes.skip.tools?.deny ?? [];
+    expect(skipDeny).not.toContain("linear_add_comment");
+    expect(skipDeny).not.toContain("linear_update_issue");
+    expect(skipDeny).toContain("github_create_pr");
+  });
+
+  it("investigate denies the same write tools its instruction forbids", () => {
+    const deny = triageWorkflow.nodes.investigate.tools?.deny ?? [];
+    for (const tool of [
+      "linear_create_issue",
+      "linear_add_comment",
+      "github_create_issue",
+      "github_add_comment",
+      "github_create_pr",
+    ]) {
+      expect(deny).toContain(tool);
+    }
+  });
+
+  it("implement denies the PR tool (create_pr is the only PR-opening node)", () => {
+    const deny = triageWorkflow.nodes.implement.tools?.deny ?? [];
+    expect(deny).toContain("github_create_pr");
+  });
+});
+
+// ─── Linear magic words: triage create_pr ────────────────────────
+
+describe("triage create_pr node: Linear magic words", () => {
+  const instr = triageWorkflow.nodes.create_pr.instruction as string;
+
+  it("keeps the Sentry Fixes line", () => {
+    expect(instr).toMatch(/Fixes \{sentryShortId\}/);
+  });
+
+  it("adds the Linear Fixes line keyed to the created issue identifier", () => {
+    expect(instr).toMatch(/Fixes \{context\.create_issue\.issueIdentifier\}/);
+    expect(instr).toMatch(/Fixes OF{2}-1234/);
+    expect(instr).toMatch(/Linear/);
+  });
+});
+
+// ─── Linear magic words: implement workflow full treatment ───────
+
+describe("implement workflow: identifier branch/title/Fixes treatment", () => {
+  it("implement node mandates identifier-prefixed lowercase branch naming", () => {
+    const instr = implementWorkflow.nodes.implement.instruction as string;
+    expect(instr).toMatch(/context\.input\.issueIdentifier/);
+    expect(instr).toMatch(/lowercased/);
+    expect(instr).toMatch(/off-1234-fix-null-check/);
+  });
+
+  it("implement node mandates identifier-prefixed commit messages", () => {
+    const instr = implementWorkflow.nodes.implement.instruction as string;
+    expect(instr).toMatch(/\[OFF-1234\] fix:/);
+  });
+
+  it("create_pr node mandates the identifier PR title format", () => {
+    const instr = implementWorkflow.nodes.create_pr.instruction as string;
+    expect(instr).toMatch(/\[\{context\.input\.issueIdentifier\}\]/);
+    expect(instr).toMatch(/github_create_pr/);
+  });
+
+  it("create_pr node adds the Linear Fixes line", () => {
+    const instr = implementWorkflow.nodes.create_pr.instruction as string;
+    expect(instr).toMatch(/Fixes \{context\.input\.issueIdentifier\}/);
+    expect(instr).toMatch(/Fixes OF{2}-1234/);
+    expect(instr).toMatch(/Linear/);
+  });
+});

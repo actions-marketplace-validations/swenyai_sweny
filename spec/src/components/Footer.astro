@@ -1,0 +1,48 @@
+---
+import Analytics from "@vercel/analytics/astro";
+import SpeedInsights from "@vercel/speed-insights/astro";
+---
+
+<footer class="site-footer">
+  <nav class="footer-links">
+    <a href="https://docs.sweny.ai">Docs</a>
+    <span class="footer-sep" aria-hidden="true">&middot;</span>
+    <a href="https://marketplace.sweny.ai">Marketplace</a>
+    <span class="footer-sep" aria-hidden="true">&middot;</span>
+    <a href="https://github.com/swenyai/sweny">GitHub</a>
+  </nav>
+</footer>
+
+<Analytics />
+<SpeedInsights />
+
+<style>
+  .site-footer {
+    text-align: center;
+    padding-block: 1rem 0.5rem;
+    border-top: 1px solid var(--sl-color-gray-6);
+  }
+
+  .footer-links {
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+    font-size: var(--sl-text-sm);
+  }
+
+  .footer-links a {
+    color: var(--sl-color-gray-3);
+    text-decoration: none;
+  }
+
+  .footer-links a:hover {
+    color: var(--sl-color-text-accent);
+    text-decoration: underline;
+  }
+
+  .footer-sep {
+    color: var(--sl-color-gray-5);
+  }
+</style>

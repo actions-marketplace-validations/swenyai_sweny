@@ -1,43 +1,52 @@
 import { useState } from "react";
 import { useStore } from "zustand";
-import type { WorkflowPhase } from "@sweny-ai/engine";
-import type { RecipeDefinition } from "@sweny-ai/engine";
+import type { Workflow } from "@sweny-ai/core";
 import { useEditorStore, useTemporalStore } from "../store/editor-store.js";
 import type { StudioMode } from "../store/editor-store.js";
 import { ImportModal } from "./ImportModal.js";
+import { HelpPanel } from "./HelpPanel.js";
+import { exportWorkflowYaml } from "../lib/export-yaml.js";
 import { exportAsTypescript } from "../lib/export-typescript.js";
+import { exportAsGitHubActions } from "../lib/export-github-actions.js";
 import { buildPermalinkUrl } from "../lib/permalink.js";
 
 interface ToolbarProps {
-  onRecipeChange(id: string): void;
-  activeRecipeId: string;
-  availableRecipes: Array<{ id: string; name: string }>;
+  onWorkflowChange(id: string): void;
+  activeWorkflowId: string;
+  availableWorkflows: Array<{ id: string; name: string }>;
   showImport: boolean;
   onShowImportChange(open: boolean): void;
+  showHelp: boolean;
+  onShowHelpChange(open: boolean): void;
+  onFork?(): void;
+  onNew?(): void;
+  isBuiltinWorkflow?: boolean;
 }
 
 export function Toolbar({
-  onRecipeChange,
-  activeRecipeId,
-  availableRecipes,
+  onWorkflowChange,
+  activeWorkflowId,
+  availableWorkflows,
   showImport,
   onShowImportChange,
+  showHelp,
+  onShowHelpChange,
+  onFork,
+  onNew,
+  isBuiltinWorkflow,
 }: ToolbarProps) {
   const temporalStore = useTemporalStore();
 
-  // Subscribe reactively to pastStates/futureStates
   const pastStates = useStore(temporalStore, (s) => s.pastStates);
   const futureStates = useStore(temporalStore, (s) => s.futureStates);
 
-  const definition = useEditorStore((s) => s.definition);
-  const setDefinition = useEditorStore((s) => s.setDefinition);
-  const addState = useEditorStore((s) => s.addState);
+  const setWorkflow = useEditorStore((s) => s.setWorkflow);
   const mode = useEditorStore((s) => s.mode);
   const setMode = useEditorStore((s) => s.setMode);
   const resetExecution = useEditorStore((s) => s.resetExecution);
-  const [newStateId, setNewStateId] = useState("");
-  const [newStatePhase, setNewStatePhase] = useState<WorkflowPhase>("act");
+
   const [copied, setCopied] = useState(false);
+  const [showExport, setShowExport] = useState(false);
 
   function switchMode(newMode: StudioMode) {
     if (newMode !== mode) {
@@ -46,84 +55,107 @@ export function Toolbar({
     }
   }
 
-  function handleImport(def: RecipeDefinition) {
+  function handleImport(wf: Workflow) {
     temporalStore.getState().clear();
-    setDefinition(def);
+    setWorkflow(wf);
   }
 
-  function handleExport() {
-    const json = JSON.stringify(definition, null, 2);
-    const blob = new Blob([json], { type: "application/json" });
+  function download(content: string, filename: string, mime: string) {
+    const blob = new Blob([content], { type: mime });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `${definition.id}.recipe.json`;
+    a.download = filename;
     a.click();
     URL.revokeObjectURL(url);
+    setShowExport(false);
   }
 
-  function handleExportTs() {
-    const { definition: def } = useEditorStore.getState();
-    const content = exportAsTypescript(def);
-    const blob = new Blob([content], { type: "text/plain" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = `${def.id}.ts`;
-    a.click();
-    URL.revokeObjectURL(url);
+  function handleExportYaml() {
+    const { workflow } = useEditorStore.getState();
+    download(exportWorkflowYaml(workflow), `${workflow.id}.workflow.yaml`, "text/yaml");
+  }
+
+  function handleExportJson() {
+    const { workflow } = useEditorStore.getState();
+    download(JSON.stringify(workflow, null, 2), `${workflow.id}.workflow.json`, "application/json");
+  }
+
+  function handleExportTypescript() {
+    const { workflow } = useEditorStore.getState();
+    download(exportAsTypescript(workflow), `${workflow.id}.workflow.ts`, "text/plain");
+  }
+
+  function handleExportGitHubActions() {
+    const { workflow } = useEditorStore.getState();
+    download(exportAsGitHubActions(workflow), `sweny-${workflow.id}.yml`, "text/yaml");
   }
 
   function handleCopyLink() {
-    const { definition: def } = useEditorStore.getState();
-    const url = buildPermalinkUrl(def);
+    const { workflow } = useEditorStore.getState();
+    const url = buildPermalinkUrl(workflow);
     navigator.clipboard.writeText(url).then(
       () => {
         setCopied(true);
         setTimeout(() => setCopied(false), 2000);
       },
-      () => {
-        // Clipboard write failed (non-HTTPS or browser security policy).
-        // The URL bar already reflects the current recipe via the hash sync in App.tsx,
-        // so the user can still copy it manually. No additional action needed.
+      (err) => {
+        console.error("Failed to copy share link:", err);
       },
     );
-  }
-
-  function handleAddState(e: React.FormEvent) {
-    e.preventDefault();
-    if (!newStateId.trim()) return;
-    addState(newStateId.trim(), newStatePhase);
-    setNewStateId("");
   }
 
   return (
     <div className="flex items-center gap-2 px-4 py-2 bg-gray-900 text-white text-sm border-b border-gray-700 flex-shrink-0">
       {/* Brand */}
-      <span className="font-bold text-white mr-2">sweny studio</span>
+      <span className="font-bold text-white mr-1">sweny studio</span>
 
-      {/* Recipe switcher */}
-      <div className="flex gap-1 mr-4">
-        {availableRecipes.map((r) => (
+      {/* Divider */}
+      <div className="w-px h-5 bg-gray-600 mx-1" />
+
+      {/* Workflow switcher */}
+      <div className="flex gap-1">
+        {availableWorkflows.map((w) => (
           <button
-            key={r.id}
-            onClick={() => onRecipeChange(r.id)}
-            className={`px-3 py-1 rounded text-xs ${
-              activeRecipeId === r.id ? "bg-blue-600 text-white" : "bg-gray-700 text-gray-300 hover:bg-gray-600"
+            key={w.id}
+            onClick={() => onWorkflowChange(w.id)}
+            className={`px-2.5 py-1 rounded text-xs ${
+              activeWorkflowId === w.id ? "bg-blue-600 text-white" : "bg-gray-700 text-gray-300 hover:bg-gray-600"
             }`}
           >
-            {r.name}
+            {w.name}
           </button>
         ))}
+        {isBuiltinWorkflow && onFork && (
+          <button
+            onClick={onFork}
+            title="Fork this workflow to customize it"
+            className="px-2.5 py-1 rounded bg-gray-700 hover:bg-gray-600 text-xs text-amber-300"
+          >
+            fork
+          </button>
+        )}
+        {onNew && (
+          <button
+            onClick={onNew}
+            title="Create a blank workflow (Cmd+N)"
+            className="px-2.5 py-1 rounded bg-gray-700 hover:bg-gray-600 text-xs text-green-400"
+          >
+            + new
+          </button>
+        )}
       </div>
 
-      {/* Mode toggle: Design | Simulate | Live */}
-      <div className="flex rounded overflow-hidden border border-gray-600 mr-2">
+      {/* Divider */}
+      <div className="w-px h-5 bg-gray-600 mx-1" />
+
+      {/* Mode toggle */}
+      <div className="flex rounded overflow-hidden border border-gray-600">
         {(["design", "simulate", "live"] as StudioMode[]).map((m) => (
           <button
             key={m}
             onClick={() => switchMode(m)}
-            className={`px-3 py-1 text-xs ${mode === m ? "bg-blue-600 text-white" : "bg-gray-700 text-gray-300 hover:bg-gray-600"}`}
+            className={`px-2.5 py-1 text-xs ${mode === m ? "bg-blue-600 text-white" : "bg-gray-700 text-gray-300 hover:bg-gray-600"}`}
           >
             {m}
           </button>
@@ -135,70 +167,78 @@ export function Toolbar({
         onClick={() => temporalStore.getState().undo()}
         disabled={pastStates.length === 0}
         title="Undo (Cmd+Z)"
-        className="px-2 py-1 rounded bg-gray-700 disabled:opacity-40 hover:bg-gray-600"
+        className="px-2 py-1 rounded bg-gray-700 disabled:opacity-40 hover:bg-gray-600 text-xs"
       >
-        ↩
+        undo
       </button>
       <button
         onClick={() => temporalStore.getState().redo()}
         disabled={futureStates.length === 0}
         title="Redo (Cmd+Shift+Z)"
-        className="px-2 py-1 rounded bg-gray-700 disabled:opacity-40 hover:bg-gray-600"
+        className="px-2 py-1 rounded bg-gray-700 disabled:opacity-40 hover:bg-gray-600 text-xs"
       >
-        ↪
+        redo
       </button>
 
       <div className="flex-1" />
 
-      {/* Add state */}
-      <form onSubmit={handleAddState} className="flex gap-1">
-        <input
-          value={newStateId}
-          onChange={(e) => setNewStateId(e.target.value)}
-          placeholder="state-id"
-          className="px-2 py-1 rounded bg-gray-700 text-white text-xs w-28 placeholder-gray-400"
-        />
-        <select
-          value={newStatePhase}
-          onChange={(e) => setNewStatePhase(e.target.value as WorkflowPhase)}
-          className="px-1 py-1 rounded bg-gray-700 text-white text-xs"
-        >
-          <option value="learn">learn</option>
-          <option value="act">act</option>
-          <option value="report">report</option>
-        </select>
-        <button type="submit" className="px-2 py-1 rounded bg-blue-600 hover:bg-blue-500 text-xs">
-          + State
-        </button>
-      </form>
-
       {/* Import */}
       <button
         onClick={() => onShowImportChange(true)}
-        className="px-3 py-1 rounded bg-gray-700 hover:bg-gray-600 text-xs"
+        className="px-2.5 py-1 rounded bg-gray-700 hover:bg-gray-600 text-xs"
       >
-        ↑ Import
+        Import
       </button>
 
-      {/* Export */}
-      <button onClick={handleExport} className="px-3 py-1 rounded bg-gray-700 hover:bg-gray-600 text-xs ml-2">
-        ↓ Export JSON
-      </button>
-
-      {/* Export TS */}
-      <button onClick={handleExportTs} className="px-3 py-1 rounded bg-gray-700 hover:bg-gray-600 text-xs">
-        ↓ Export TS
-      </button>
+      {/* Export dropdown */}
+      <div className="relative">
+        <button
+          onClick={() => setShowExport((v) => !v)}
+          onBlur={() => setTimeout(() => setShowExport(false), 150)}
+          className="px-2.5 py-1 rounded bg-gray-700 hover:bg-gray-600 text-xs"
+        >
+          Export
+        </button>
+        {showExport && (
+          <div className="absolute top-full right-0 mt-1 bg-gray-800 border border-gray-600 rounded shadow-lg py-1 min-w-[140px] z-50">
+            <button onClick={handleExportYaml} className="block w-full text-left px-3 py-1.5 text-xs hover:bg-gray-700">
+              YAML
+            </button>
+            <button onClick={handleExportJson} className="block w-full text-left px-3 py-1.5 text-xs hover:bg-gray-700">
+              JSON
+            </button>
+            <button
+              onClick={handleExportTypescript}
+              className="block w-full text-left px-3 py-1.5 text-xs hover:bg-gray-700"
+            >
+              TypeScript
+            </button>
+            <button
+              onClick={handleExportGitHubActions}
+              className="block w-full text-left px-3 py-1.5 text-xs hover:bg-gray-700"
+            >
+              GitHub Actions
+            </button>
+          </div>
+        )}
+      </div>
 
       {/* Share link */}
+      <button onClick={handleCopyLink} className="px-2.5 py-1 text-xs bg-gray-700 rounded hover:bg-gray-600">
+        {copied ? "Copied!" : "Share"}
+      </button>
+
+      {/* Help */}
       <button
-        onClick={handleCopyLink}
-        className="px-3 py-1 text-xs bg-gray-700 text-gray-200 rounded hover:bg-gray-600"
+        onClick={() => onShowHelpChange(true)}
+        title="Keyboard shortcuts (?)"
+        className="px-2 py-1 rounded bg-gray-700 hover:bg-gray-600 text-xs text-gray-300"
       >
-        {copied ? "Copied!" : "Share link"}
+        ?
       </button>
 
       {showImport && <ImportModal onImport={handleImport} onClose={() => onShowImportChange(false)} />}
+      {showHelp && <HelpPanel onClose={() => onShowHelpChange(false)} />}
     </div>
   );
 }

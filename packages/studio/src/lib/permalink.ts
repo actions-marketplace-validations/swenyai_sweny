@@ -1,24 +1,23 @@
-import type { RecipeDefinition } from "@sweny-ai/engine";
-import { validateDefinition } from "@sweny-ai/engine";
+import type { Workflow } from "@sweny-ai/core";
+import { validateWorkflow } from "@sweny-ai/core/schema";
 
 const HASH_KEY = "def";
 
 /**
- * Encode a RecipeDefinition as a URL-safe base64 string.
+ * Encode a Workflow as a URL-safe base64 string.
  */
-export function encodeRecipe(definition: RecipeDefinition): string {
-  const json = JSON.stringify(definition);
-  // btoa requires latin1 — use encodeURIComponent + escape for unicode safety
+export function encodeWorkflow(workflow: Workflow): string {
+  const json = JSON.stringify(workflow);
   return btoa(
     encodeURIComponent(json).replace(/%([0-9A-F]{2})/g, (_, p1: string) => String.fromCharCode(parseInt(p1, 16))),
   );
 }
 
 /**
- * Decode a base64 string from the URL hash back to a RecipeDefinition.
+ * Decode a base64 string from the URL hash back to a Workflow.
  * Returns null if the hash is missing, malformed, or fails validation.
  */
-export function decodeRecipe(encoded: string): RecipeDefinition | null {
+export function decodeWorkflow(encoded: string): Workflow | null {
   try {
     const json = decodeURIComponent(
       Array.from(atob(encoded))
@@ -26,46 +25,41 @@ export function decodeRecipe(encoded: string): RecipeDefinition | null {
         .join(""),
     );
     const raw: unknown = JSON.parse(json);
-    // Guard the minimum required fields before treating as RecipeDefinition
     if (
       !raw ||
       typeof raw !== "object" ||
       typeof (raw as Record<string, unknown>).id !== "string" ||
       typeof (raw as Record<string, unknown>).name !== "string" ||
-      typeof (raw as Record<string, unknown>).version !== "string" ||
-      typeof (raw as Record<string, unknown>).initial !== "string" ||
-      typeof (raw as Record<string, unknown>).states !== "object" ||
-      (raw as Record<string, unknown>).states === null
+      typeof (raw as Record<string, unknown>).entry !== "string" ||
+      typeof (raw as Record<string, unknown>).nodes !== "object" ||
+      (raw as Record<string, unknown>).nodes === null
     ) {
       return null;
     }
-    const def = raw as RecipeDefinition;
-    // Reject only structural errors (MISSING_INITIAL); allow UNKNOWN_TARGET so users
-    // can load and fix broken recipes in the editor.
-    if (validateDefinition(def).some((e) => e.code === "MISSING_INITIAL")) return null;
-    return def;
+    const wf = raw as Workflow;
+    if (validateWorkflow(wf).some((e) => e.code === "MISSING_ENTRY")) return null;
+    return wf;
   } catch {
     return null;
   }
 }
 
 /**
- * Read the recipe from the current URL hash, if present.
- * Returns null if no #def= found or if decode fails.
+ * Read the workflow from the current URL hash, if present.
  */
-export function readPermalinkFromHash(): RecipeDefinition | null {
-  const hash = window.location.hash.slice(1); // remove leading #
+export function readPermalinkFromHash(): Workflow | null {
+  const hash = window.location.hash.slice(1);
   const params = new URLSearchParams(hash);
   const encoded = params.get(HASH_KEY);
   if (!encoded) return null;
-  return decodeRecipe(encoded);
+  return decodeWorkflow(encoded);
 }
 
 /**
- * Build a shareable URL for the given definition.
+ * Build a shareable URL for the given workflow.
  */
-export function buildPermalinkUrl(definition: RecipeDefinition): string {
-  const encoded = encodeRecipe(definition);
+export function buildPermalinkUrl(workflow: Workflow): string {
+  const encoded = encodeWorkflow(workflow);
   const url = new URL(window.location.href);
   url.hash = `${HASH_KEY}=${encoded}`;
   return url.toString();

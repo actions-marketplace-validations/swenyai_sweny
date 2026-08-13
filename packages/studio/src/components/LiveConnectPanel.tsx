@@ -1,15 +1,15 @@
 import { useState, useRef, useEffect } from "react";
 import { useEditorStore } from "../store/editor-store.js";
-import type { ExecutionEvent } from "@sweny-ai/engine";
+import type { ExecutionEvent, NodeResult } from "@sweny-ai/core";
 
 export function LiveConnectPanel() {
-  const { liveConnection, setLiveConnection, applyEvent, resetExecution, setMode } = useEditorStore();
+  const { liveConnection, setLiveConnection, applyEvent, resetExecution, setMode, completedNodes, currentNodeId } =
+    useEditorStore();
   const [url, setUrl] = useState("ws://localhost:4000/events");
   const [transport, setTransport] = useState<"websocket" | "sse">("websocket");
   const wsRef = useRef<WebSocket | null>(null);
   const evsRef = useRef<EventSource | null>(null);
 
-  // Cleanup on unmount
   useEffect(() => {
     return () => {
       wsRef.current?.close();
@@ -19,7 +19,6 @@ export function LiveConnectPanel() {
 
   function connect() {
     resetExecution();
-    // Capture url/transport at connect time — closures below must not close over state variables
     const connUrl = url;
     const connTransport = transport;
     setLiveConnection({ url: connUrl, transport: connTransport, status: "connecting" });
@@ -47,7 +46,6 @@ export function LiveConnectPanel() {
         setLiveConnection({ url: connUrl, transport: connTransport, status: "disconnected" });
       };
     } else {
-      // SSE
       const es = new EventSource(connUrl);
       evsRef.current = es;
 
@@ -63,6 +61,10 @@ export function LiveConnectPanel() {
       };
 
       es.onerror = () => {
+        // EventSource auto-reconnects on a transient error. Close it before
+        // nulling the ref so the failed stream stops retrying in the
+        // background (and disconnect() can't reach it once the ref is gone).
+        es.close();
         evsRef.current = null;
         setLiveConnection({ url: connUrl, transport: connTransport, status: "error", error: "SSE error" });
       };
@@ -130,6 +132,39 @@ export function LiveConnectPanel() {
         )}
       </div>
       {liveConnection?.error && <p className="text-xs text-red-600 mt-1">{liveConnection.error}</p>}
+
+      {/* Execution trace */}
+      {(currentNodeId || Object.keys(completedNodes).length > 0) && (
+        <div className="mt-2 max-h-36 overflow-y-auto flex flex-col gap-0.5">
+          {Object.entries(completedNodes as Record<string, NodeResult>).map(([id, result]) => {
+            const icon = result.status === "success" ? "ok" : result.status === "failed" ? "fail" : "skip";
+            const iconColor =
+              result.status === "success"
+                ? "text-green-600"
+                : result.status === "failed"
+                  ? "text-red-600"
+                  : "text-gray-400";
+            return (
+              <div key={id} className="flex items-baseline gap-1.5 text-xs leading-tight">
+                <span className={`font-bold flex-shrink-0 ${iconColor}`}>{icon}</span>
+                <span className="font-mono text-gray-700 flex-shrink-0">{id}</span>
+                {result.toolCalls.length > 0 && (
+                  <span className="px-1 rounded bg-blue-50 text-blue-600 text-[10px] flex-shrink-0">
+                    {result.toolCalls.length} tools
+                  </span>
+                )}
+              </div>
+            );
+          })}
+          {currentNodeId && (
+            <div className="flex items-baseline gap-1.5 text-xs leading-tight text-blue-500 animate-pulse">
+              <span className="font-bold flex-shrink-0">*</span>
+              <span className="font-mono flex-shrink-0">{currentNodeId}</span>
+              <span className="text-[10px] text-blue-400">running...</span>
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }

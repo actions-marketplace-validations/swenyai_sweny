@@ -1,79 +1,169 @@
 ---
 title: SWEny
-description: An AI-powered engineering platform that learns from your logs, fixes issues, and reports results
+description: Turn natural language into reliable AI workflows — describe a task, get a DAG, run it
 template: splash
 hero:
-  tagline: "SWEny is a platform for building AI-powered engineering workflows. Connect any observability source, take action with AI, and report results through any channel. Triage is the first recipe — it monitors your production logs, investigates errors, and opens fix PRs automatically."
+  tagline: "Describe a task. Get a workflow. Run it."
   actions:
-    - text: Get Started in 5 Minutes
-      link: /getting-started/
+    - text: Get Started
+      link: /getting-started/quick-start/
       icon: right-arrow
       variant: primary
+    - text: Browse Marketplace
+      link: https://marketplace.sweny.ai
+      icon: external
+      variant: secondary
     - text: View on GitHub
       link: https://github.com/swenyai/sweny
       icon: external
       variant: minimal
 ---
 
-import { Card, CardGrid } from "@astrojs/starlight/components";
+import { Card, CardGrid, LinkCard } from "@astrojs/starlight/components";
 
-## What it does
+```bash
+npm install -g @sweny-ai/core
+```
 
-SWEny's workflow engine orchestrates three phases — **Learn**, **Act**, **Report** — to automate engineering tasks end-to-end:
+SWEny uses [Claude](https://claude.ai/) as its AI engine. You'll need an Anthropic API key, OAuth token, or authenticated Claude Code instance.
 
-1. **Learn** — connects to your observability stack, pulls errors and log data, checks your issue tracker for duplicates, and builds context
-2. **Act** — an AI agent investigates root causes through your codebase, files tickets, creates branches, and opens fix PRs
-3. **Report** — sends results to the channels your team already uses: Slack, Teams, Discord, email, or webhooks
+```bash
+sweny workflow create "scan our repo for security issues, check dependencies \
+  for vulnerabilities, and create Linear tickets for anything critical"
+```
 
-Triage is the first recipe built on this engine. It runs on a schedule, finds novel production errors, and fixes them without waking anyone up. See [Engine & Recipes](/getting-started/engine/) to learn how the engine works and how to build your own recipes.
+```
+GitHub Security Audit
 
-## See it in action
+┌─────────────────────────────────┐
+│ ○ Scan Commits for Secrets      │
+└───────────────┬─────────────────┘
+                │
+┌───────────────▼─────────────────┐
+│ ○ Scan Deps for Vulnerabilities │
+└───────────────┬─────────────────┘
+                │
+┌───────────────▼─────────────────┐
+│ ○ Compile Security Report       │
+└───────────────┬─────────────────┘
+                │
+┌───────────────▼─────────────────┐
+│ ○ Create Linear Tickets         │
+└─────────────────────────────────┘
 
-Want to understand the full flow? Read the [end-to-end walkthrough](/getting-started/walkthrough/) — a real error spike from Datadog through to a merged PR.
+Save to security_audit.yml? [Y/n/refine]
+```
 
-## Works with your stack
+```bash
+sweny workflow run .sweny/workflows/github_security_audit.yml
+```
 
-<CardGrid stagger>
-  <Card title="Observability" icon="magnifier">
-    **Datadog**, **Sentry**, **CloudWatch**, **Splunk**, **Elasticsearch**, **New Relic**, **Grafana Loki** — query logs
-    and aggregate errors from your existing monitoring.
+```
+✓ [1/4] Scan Commits for Exposed Secrets   12s
+  ↳ Searched 847 commits, 0 secrets found
+✓ [2/4] Scan Dependencies for Vulns        28s
+  ↳ 2 critical CVEs in transitive deps
+⠹ [3/4] Compile Security Report            6s
+  ↳ Analyzing findings…
+```
+
+That's it. One sentence in, a full workflow out. No YAML to write, no boilerplate, no config.
+
+Don't like the result? Edit it the same way you created it:
+
+```bash
+sweny workflow edit security_audit.yml "add a quality gate that rejects \
+  vague findings, and loop back to re-scan if rejected"
+```
+
+---
+
+## Built-in workflows
+
+SWEny ships two production-ready workflows you can run immediately:
+
+<CardGrid>
+  <Card title="Triage" icon="warning">
+    Monitors your observability platform for errors, investigates root causes, creates issues, writes fixes, and opens
+    PRs — automatically. [Learn more](/workflows/triage/)
   </Card>
-  <Card title="Issue Tracking" icon="list-format">
-    **Linear**, **GitHub Issues**, **Jira** — create tickets, search for duplicates, link PRs automatically.
-  </Card>
-  <Card title="Source Control" icon="github">
-    **GitHub**, **GitLab** — create branches, push commits, open PRs, dispatch cross-repo workflows.
-  </Card>
-  <Card title="Notification" icon="comment">
-    **GitHub Summary**, **Slack**, **Teams**, **Discord**, **Email**, **Webhook** — send results wherever your team
-    works.
-  </Card>
-  <Card title="Incident" icon="warning">
-    **PagerDuty** — create incidents, acknowledge, resolve, check on-call schedules.
-  </Card>
-  <Card title="Storage" icon="document">
-    **Filesystem**, **S3** — persist sessions, memory, and workspace files for the agent.
+  <Card title="Implement" icon="rocket">
+    Takes an existing issue, analyzes the codebase, writes a fix, opens a PR, and notifies your team. Trigger it
+    manually or chain it from Triage. [Learn more](/workflows/implement/)
   </Card>
 </CardGrid>
 
-## Two deployment modes
+```bash
+sweny triage --dry-run          # investigate production errors
+sweny implement ENG-123         # fix a tracked issue and open a PR
+```
 
-Both modes are powered by SWEny's workflow engine, which manages provider connections, step orchestration, and the Learn/Act/Report pipeline.
+Or [build your own](/workflows/custom/) from a single sentence with `sweny workflow create`.
 
-**GitHub Action** — runs on a cron schedule in your CI. No servers, no infrastructure. This is the primary deployment.
+## E2E browser testing
 
-**Interactive Agent** — a bot your team can chat with. Ask it to investigate errors, query logs, or write fixes interactively. Currently supports Slack, with more channels planned. Deploy as a container or run locally as a CLI.
+Generate AI-driven end-to-end tests for any web app — no test scripts to write:
 
-## Quick install
+```bash
+sweny new e2e        # wizard asks about your flows → generates workflow YAML
+sweny workflow run   # AI agent drives a real browser to test your app
+```
+
+The wizard supports 7 flow types — registration, login, purchase, onboarding, upgrade, cancellation, and custom. Each generates a self-contained workflow with auto-generated test credentials and optional cleanup. [Get started with E2E testing](/cli/e2e/)
+
+## Beyond DevOps
+
+SWEny workflows aren't limited to triage and fixes. Teams use them to replace brittle data pipelines, automate research, and build quality-gated extraction systems.
+
+<CardGrid>
+  <Card title="Data Pipelines" icon="document">
+    Turn unstructured documents into structured data with LLM extraction, automated quality gates, and change detection.
+    [Read the deep-dive](/use-cases/data-pipelines/)
+  </Card>
+  <Card title="Security Reviews" icon="approve-check-circle">
+    Ingest vendor questionnaires, draft answers from your security posture docs, and validate nothing is overstated.
+  </Card>
+  <LinkCard
+    title="See all use cases"
+    href="/use-cases/"
+    description="Competitive monitoring, contract management, feedback synthesis, and more."
+  />
+</CardGrid>
+
+## Run it on a schedule
+
+Deploy any workflow to GitHub Actions with three secrets and a cron schedule. SWEny monitors your production errors and opens fix PRs while you sleep.
 
 ```yaml
 # .github/workflows/sweny-triage.yml
-- uses: swenyai/sweny@v0.2
+- uses: swenyai/triage@v1
   with:
     claude-oauth-token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
-    dd-api-key: ${{ secrets.DD_API_KEY }}
-    dd-app-key: ${{ secrets.DD_APP_KEY }}
-    dry-run: true # Remove when ready to create PRs
+    observability-provider: sentry
+    sentry-auth-token: ${{ secrets.SENTRY_AUTH_TOKEN }}
 ```
 
-3 secrets. GitHub Issues by default. [Full setup guide →](/getting-started/)
+[Full Action guide](/action/) — setup, scheduling, and service maps.
+
+## Use it from Claude Code
+
+Install the [Claude Code plugin](/advanced/mcp-plugin/) and get slash commands, MCP tools, and a startup hook — without leaving your conversation:
+
+```
+/plugin marketplace add swenyai/sweny
+/plugin install sweny@sweny-official
+```
+
+Then type `/sweny:triage`, `/sweny:implement ENG-123`, `/sweny:e2e-run`, or any of the 11 available commands. Claude can also autonomously delegate tasks to SWEny's DAG executor via MCP tools.
+
+## Connect to your stack
+
+SWEny connects to the tools you already use — GitHub, Linear, Sentry, Datadog, BetterStack, Slack, and more — through built-in [skills](/skills/) and [MCP servers](/advanced/mcp-servers/). Set an API key and the skill is ready. Bring your own MCP servers to connect anything else.
+
+## Studio
+
+[Studio](/studio/) is a visual DAG editor and live execution monitor. Design workflows by dragging nodes, or watch running workflows execute node-by-node in real time. Pass `--stream` to any CLI run to pipe events into Studio.
+
+## Workflow Marketplace
+
+**[marketplace.sweny.ai](https://marketplace.sweny.ai)** — a community catalog of ready-to-run SWEny workflows. Browse by category, copy a workflow into `.sweny/workflows/`, customize the steps, and run it. The CLI and Action are free and always will be.

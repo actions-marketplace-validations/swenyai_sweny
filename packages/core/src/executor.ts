@@ -1,0 +1,1203 @@
+/**
+ * Workflow Executor
+ *
+ * Walks a workflow graph node-by-node. At each node, Claude gets
+ * the node's instruction + available skill tools + context from
+ * prior nodes. Claude does the work, then the executor resolves
+ * which edge to follow next.
+ *
+ * Supports controlled cycles via max_iterations on edges — when
+ * an edge has been followed max_iterations times, it is excluded
+ * from routing, causing flow to fall through to alternative paths.
+ *
+ * This replaces ~8k lines of engine + recipe step code.
+ */
+
+import type {
+  Workflow,
+  Node,
+  NodeSources,
+  NodeToolFilter,
+  Skill,
+  SkillDefinition,
+  Tool,
+  Claude,
+  Observer,
+  NodeResult,
+  Logger,
+  ToolContext,
+  ConfigField,
+  ExecutionEvent,
+  ExecutionTrace,
+  ExecutionResult,
+  JSONSchema,
+  Source,
+  ResolvedSource,
+  EvalResult,
+} from "./types.js";
+import { consoleLogger } from "./types.js";
+import { resolveSources } from "./source-resolver.js";
+import { evaluateAll, aggregateEval } from "./eval/index.js";
+import type { AggregateOutcome } from "./eval/index.js";
+import { evaluateRequires } from "./requires.js";
+import { buildRetryPreamble } from "./retry.js";
+import { resolveExecutionModel } from "./model.js";
+import { buildToolAliases } from "./skills/index.js";
+
+export interface ExecuteOptions {
+  /** Registered skills (id → Skill) */
+  skills: Map<string, Skill>;
+  /** Config values — env vars + explicit overrides */
+  config?: Record<string, string>;
+  /** Claude client */
+  claude: Claude;
+  /** Event observer for streaming/logging */
+  observer?: Observer;
+  /** Logger */
+  logger?: Logger;
+  /** Working directory for resolving file Sources (default: process.cwd()) */
+  cwd?: string;
+  /** Environment variables for Source resolution auth lookup */
+  env?: NodeJS.ProcessEnv;
+  /** Host → env-var-name map for URL Source authentication */
+  fetchAuth?: Record<string, string>;
+  /** When true, URL Sources throw instead of fetching */
+  offline?: boolean;
+  /**
+   * When set, `file:` Sources are sandboxed to this directory tree: a `file:`
+   * source that resolves outside it (via `..` traversal, an absolute path, or a
+   * symlink pointing out) is rejected with `SOURCE_FILE_OUTSIDE_ROOT`. The
+   * sandbox is opt-in: when unset, `file:` sources may read anywhere on disk
+   * (default), preserving the read-anywhere behavior workflow authors rely on
+   * for files elsewhere in their own repo / machine.
+   */
+  fileRoot?: string;
+  /**
+   * Workflow-level hard cap on total node executions (the number of times the
+   * main loop visits a node). Guards against unbounded cycles, e.g. a back-edge
+   * with no `max_iterations` or an LLM route evaluator that keeps choosing the
+   * loop-back edge. Defaults to {@link DEFAULT_MAX_STEPS}. When exceeded the
+   * executor throws a clear "step budget exceeded" error rather than hanging.
+   * Per-edge `max_iterations` behavior is unchanged.
+   */
+  max_steps?: number;
+  /**
+   * Caller-supplied abort signal. When it aborts, `execute()` rejects promptly
+   * and issues no further node / eval / route model calls. The signal is also
+   * threaded into every `claude.run` / `claude.evaluate` / `claude.ask` call so
+   * the underlying query is interrupted rather than left running detached.
+   * Default: no signal (back-compat).
+   */
+  signal?: AbortSignal;
+  /**
+   * Per-model-call wall-clock budget in ms, forwarded to every `claude.run` /
+   * `claude.evaluate` / `claude.ask` call. This is a per-call timeout, not a
+   * whole-run budget. Default: no timeout (back-compat).
+   */
+  timeoutMs?: number;
+}
+
+/**
+ * Default workflow-level step budget. Counts total node executions across the
+ * whole run (loop iterations included). Generous enough for legitimate deep
+ * workflows with controlled cycles, tight enough to terminate a runaway loop
+ * before it burns meaningful model spend.
+ */
+export const DEFAULT_MAX_STEPS = 200;
+
+/** Abort/timeout plumbing threaded into routing model calls. */
+interface AbortOptions {
+  signal?: AbortSignal;
+  timeoutMs?: number;
+}
+
+/**
+ * Throw a clear "workflow aborted" error if the caller's signal has aborted.
+ * Used at the top of the run loop and before issuing any further model call so
+ * an aborted run stops promptly instead of advancing to the next node.
+ */
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    throw new Error("workflow aborted");
+  }
+}
+
+/**
+ * Execute a workflow from entry to completion.
+ *
+ * Returns an ExecutionResult with:
+ * - `results`: map of node ID → final result (last execution if retried)
+ * - `trace`: full ordered execution trace including loops and routing decisions
+ */
+export async function execute(workflow: Workflow, input: unknown, options: ExecuteOptions): Promise<ExecutionResult> {
+  const { claude, observer, signal, timeoutMs } = options;
+
+  // If the caller already aborted before we started, fail fast.
+  throwIfAborted(signal);
+
+  // Merge inline workflow skills into the skill map so they resolve at runtime.
+  // Inline skills (instruction/mcp only) become Skill objects with empty tools/config.
+  // The caller's skill map takes precedence — inline skills only fill gaps.
+  const skills = mergeInlineSkills(options.skills, workflow.skills);
+
+  const config = resolveConfig(skills, options.config, options.env ?? process.env);
+  const logger = options.logger ?? consoleLogger;
+  const results = new Map<string, NodeResult>();
+  const edgeCounts = new Map<string, number>(); // "from→to" → times followed
+  const nodeRunCounts = new Map<string, number>(); // node → times executed
+  const maxSteps = options.max_steps ?? DEFAULT_MAX_STEPS;
+  let stepCount = 0; // total node executions across the run (loop iterations included)
+  const trace: ExecutionTrace = { steps: [], edges: [], sources: {} };
+
+  validate(workflow, skills);
+
+  // Build an eval-time alias table from the loaded skills. Each skill owns
+  // its own mapping between skill-tool names and equivalent MCP names. Core
+  // stays vendor-neutral; this call just unions what the skills declare.
+  const toolAliases = buildToolAliases(skills.values(), logger);
+
+  // Soft-cap warning: count declared judge evaluators across all nodes and
+  // warn if the total exceeds workflow.judge_budget (default 50). Spec says
+  // this is informational, not a hard runtime cap; users hit the warning
+  // when they unintentionally fan out judges (e.g. 10 judges × 50 nodes).
+  warnOnJudgeBudget(workflow, logger);
+
+  // ── Source resolution phase ─────────────────────────────────────
+  // Resolve all Source values (node instructions + rules/context at every
+  // level) into plain text before the main execution loop. This eagerly
+  // fetches file/URL content so the execution path is pure-compute.
+  const sourceMap: Record<string, Source> = {};
+
+  // Node instructions
+  for (const [nodeId, node] of Object.entries(workflow.nodes)) {
+    sourceMap[`nodes.${nodeId}.instruction`] = node.instruction;
+  }
+
+  // Runtime input rules/context (accepts Source | Source[])
+  const inputRules = extractRuntimeInputSources(input, "rules");
+  const inputContext = extractRuntimeInputSources(input, "context");
+  inputRules.forEach((s, i) => (sourceMap[`input.rules.${i}`] = s));
+  inputContext.forEach((s, i) => (sourceMap[`input.context.${i}`] = s));
+
+  // Workflow-level rules/context
+  (workflow.rules ?? []).forEach((s, i) => (sourceMap[`workflow.rules.${i}`] = s));
+  (workflow.context ?? []).forEach((s, i) => (sourceMap[`workflow.context.${i}`] = s));
+
+  // Node-level rules/context
+  for (const [nodeId, node] of Object.entries(workflow.nodes)) {
+    const nodeRules = nodeSourcesToArray(node.rules).sources;
+    const nodeContext = nodeSourcesToArray(node.context).sources;
+    nodeRules.forEach((s, i) => (sourceMap[`nodes.${nodeId}.rules.${i}`] = s));
+    nodeContext.forEach((s, i) => (sourceMap[`nodes.${nodeId}.context.${i}`] = s));
+  }
+
+  const resolveCwd = options.cwd ?? process.cwd();
+  const resolvedSources = await resolveSources(sourceMap, {
+    cwd: resolveCwd,
+    env: options.env ?? process.env,
+    authConfig: options.fetchAuth ?? {},
+    offline: options.offline ?? false,
+    // Opt-in `file:` sandbox: only engaged when the caller sets `fileRoot`.
+    // When unset, `file:` sources read anywhere on disk (default).
+    fileRoot: options.fileRoot,
+    logger,
+  });
+  trace.sources = resolvedSources;
+  safeObserve(observer, { type: "workflow:start", workflow: workflow.id }, logger);
+  safeObserve(observer, { type: "sources:resolved", sources: resolvedSources }, logger);
+
+  let currentId: string | null = workflow.entry;
+
+  while (currentId) {
+    // Abort before issuing the next node/eval/route model call. Aborting the
+    // signal mid-run makes execute() reject promptly rather than advancing.
+    throwIfAborted(signal);
+
+    const node = workflow.nodes[currentId];
+    if (!node) throw new Error(`Unknown node: "${currentId}"`);
+
+    // Workflow-level hard cap. Per-edge max_iterations bounds individual
+    // back-edges, but a self-loop (or LLM route) with no max_iterations is
+    // otherwise unbounded. This budget terminates the run loudly instead of
+    // hanging CI / the action and burning model spend.
+    stepCount++;
+    if (stepCount > maxSteps) {
+      throw new Error(
+        `step budget exceeded: workflow '${workflow.id}' ran ${stepCount} steps (max_steps: ${maxSteps}). ` +
+          `This usually means an unbounded cycle, e.g. a back-edge with no 'max_iterations' or a route that keeps ` +
+          `looping. Add 'max_iterations' to the offending edge or raise 'max_steps' if the workflow legitimately ` +
+          `needs more steps.`,
+      );
+    }
+
+    const iteration = (nodeRunCounts.get(currentId) ?? 0) + 1;
+    nodeRunCounts.set(currentId, iteration);
+
+    const resolvedInstruction = resolvedSources[`nodes.${currentId}.instruction`].content;
+    safeObserve(observer, { type: "node:enter", node: currentId, instruction: resolvedInstruction }, logger);
+    logger.info(`→ ${node.name}`, { node: currentId });
+
+    // Gather tools from the node's skills, then apply the node's optional
+    // skill-tool filter (`tools.allow` / `tools.deny`). Filtered tools are
+    // never registered for the run, so the model cannot see or call them.
+    const resolvedSkillTools = resolveTools(node.skills, skills);
+    const tools = filterNodeTools(resolvedSkillTools, node.tools, currentId, logger);
+    const skillInstructions = resolveSkillInstructions(node.skills, skills);
+
+    // Runtime guard: if this node declares skills but none resolved, the node
+    // cannot do its job (e.g. "create a Linear issue" with no linear skill).
+    // The startup validate() warns about this possibility, but only throw when
+    // the node is actually reached — unreachable nodes with missing skills are fine.
+    // Instruction-only skills (no tools) are valid — they inject context into the prompt.
+    if (node.skills.length > 0 && resolvedSkillTools.length === 0 && skillInstructions.length === 0) {
+      throw new Error(
+        `Node "${currentId}" requires skills [${node.skills.join(", ")}] but none are configured. ` +
+          `Set the required environment variables and try again.`,
+      );
+    }
+
+    // Build context: input + all prior node results.
+    // Each prior node entry is the node's `data` augmented with `evals`
+    // (a Record<name, EvalResult> for downstream lookup like
+    // `priorNode.evals.tests_run_clean.pass`). When `data` already has an
+    // `evals` key, the data field wins (back-compat with existing workflows).
+    const context: Record<string, unknown> = {
+      input,
+      ...Object.fromEntries([...results.entries()].map(([k, v]) => [k, buildPriorNodeContext(v)])),
+    };
+
+    // Pre-condition gate: evaluate `requires` against the cross-node context
+    // BEFORE invoking the LLM. Failure either marks the node failed (on_fail
+    // default) or skipped (on_fail: "skip") and skips execution entirely.
+    const requiresError = evaluateRequires(node.requires, context);
+    if (requiresError) {
+      const onFail = node.requires?.on_fail ?? "fail";
+      const result: NodeResult =
+        onFail === "skip"
+          ? {
+              status: "skipped",
+              data: { skipped_reason: requiresError.replace(/^requires failed:/, "requires not met:") },
+              toolCalls: [],
+            }
+          : {
+              status: "failed",
+              data: { error: requiresError },
+              toolCalls: [],
+            };
+      results.set(currentId, result);
+      trace.steps.push({ node: currentId, status: result.status, iteration });
+      safeObserve(observer, { type: "node:exit", node: currentId, result }, logger);
+      logger.warn(`  requires ${onFail === "skip" ? "skipped" : "failed"}: ${requiresError}`, { node: currentId });
+
+      // Apply normal routing rules (dry run gate + resolveNext).
+      // TODO: dedupe with requires path — see advanceFromNode helper below
+      const next = await advanceFromNode(
+        workflow,
+        currentId,
+        results,
+        input,
+        claude,
+        observer,
+        edgeCounts,
+        logger,
+        trace,
+        { signal, timeoutMs },
+      );
+      currentId = next;
+      continue;
+    }
+
+    // Wrap tool handlers to emit events + inject context
+    const trackedTools = tools.map((t) => ({
+      ...t,
+      handler: async (toolInput: any) => {
+        safeObserve(observer, { type: "tool:call", node: currentId!, tool: t.name, input: toolInput }, logger);
+        const toolCtx: ToolContext = { config, logger };
+        const output = await t.handler(toolInput, toolCtx);
+        safeObserve(observer, { type: "tool:result", node: currentId!, tool: t.name, output }, logger);
+        return output;
+      },
+    }));
+
+    // Prepend rules and context to instruction per cascade semantics
+    const effectiveRules = assembleCascaded(
+      "rules",
+      currentId,
+      workflow.nodes[currentId],
+      inputRules.length,
+      (workflow.rules ?? []).length,
+      resolvedSources,
+    );
+    const effectiveContext = assembleCascaded(
+      "context",
+      currentId,
+      workflow.nodes[currentId],
+      inputContext.length,
+      (workflow.context ?? []).length,
+      resolvedSources,
+    );
+    const instruction = buildNodeInstruction(
+      resolvedInstruction,
+      effectiveRules,
+      effectiveContext,
+      input,
+      skillInstructions,
+    );
+
+    // Run Claude on this node, with optional eval-failure retry loop.
+    let attempt = 0;
+    let result: NodeResult;
+    // Distinguishes an agent-level failure (claude.run returned non-success:
+    // max turns, early termination, SDK error) from an eval failure. Only
+    // agent-level failures are eligible for fail_soft below; evals are
+    // correctness gates and are never softened.
+    let agentRunFailed = false;
+    let currentInstruction = instruction;
+    const retry = node.retry;
+    // Per-node execution model: node.model ?? workflow.model. When undefined,
+    // claude.run falls back to its own client default (then Claude Code's).
+    const nodeModel = resolveExecutionModel(node, workflow);
+
+    while (true) {
+      result = await claude.run({
+        instruction: currentInstruction,
+        context,
+        tools: trackedTools,
+        outputSchema: node.output,
+        maxTurns: node.max_turns,
+        disallowedTools: node.disallowed_tools,
+        model: nodeModel,
+        signal,
+        timeoutMs,
+        onProgress: (message) => {
+          safeObserve(observer, { type: "node:progress", node: currentId!, message }, logger);
+        },
+      });
+
+      // Retry only triggers on eval failure. Bail on tool/API errors.
+      if (result.status !== "success") {
+        agentRunFailed = true;
+        break;
+      }
+
+      // Required-field gate: if the source node's declared output schema
+      // marks fields as `required`, those fields are the routing contract.
+      // An agent that omits a required field has violated the contract; we
+      // fail the node loudly rather than letting routing guess against a
+      // half-built data view. See the offload release-notes field bug:
+      // an optional quality_retry_count was declared in the schema but
+      // omitted by the agent, the route view silently dropped the key,
+      // and an "is 0 OR is undefined" condition ghost-matched.
+      //
+      // We only check declared `required` fields, not full JSON Schema
+      // validation. Type mismatches, formats, additionalProperties, etc.
+      // stay the workflow author's problem and don't have the same
+      // routing-correctness blast radius.
+      // A missing required field is a contract violation handled on the same
+      // footing as an eval failure: an otherwise-recoverable one-off omission
+      // should self-heal on a second attempt when the node has `retry`
+      // configured. We synthesize an eval-shaped failure so the retry preamble
+      // and trace bookkeeping below treat it identically. When no retry is
+      // configured (or the budget is exhausted), it still hard-fails the node.
+      const missingRequired = findMissingRequiredFields(result.data, node.output);
+
+      let outcome: AggregateOutcome;
+      if (missingRequired.length > 0) {
+        const msg = `output schema violation: required field(s) missing from emitted data: ${missingRequired.join(", ")}`;
+        const failure: EvalResult = { name: "output_required", kind: "value", pass: false, reasoning: msg };
+        outcome = { pass: false, error: msg, failures: [failure] };
+        // Still record the synthesized failure as the node's eval result so
+        // observers and downstream context see the contract violation.
+        result.evals = [failure];
+      } else {
+        const evalResults = await evaluateAll(node.eval, result, {
+          aliases: toolAliases,
+          claude,
+          node,
+          workflow,
+        });
+        result.evals = evalResults;
+        outcome = aggregateEval(evalResults, node.eval_policy ?? "all_pass");
+      }
+      if (outcome.pass) break;
+
+      // Apply the failure to the result.
+      result.status = "failed";
+      result.data = { ...result.data, error: outcome.error };
+
+      if (!retry || attempt >= retry.max) {
+        logger.warn(`  eval failed: ${outcome.error}`, { node: currentId });
+        break;
+      }
+
+      // Build retry preamble + record attempt in trace.
+      trace.steps.push({ node: currentId, status: "failed", iteration, retryAttempt: attempt });
+      logger.warn(`  eval failed (attempt ${attempt + 1}/${retry.max + 1}): ${outcome.error}`, {
+        node: currentId,
+      });
+
+      const preamble = await buildRetryPreamble({
+        retry,
+        evalFailures: outcome.failures,
+        toolCalls: result.toolCalls,
+        nodeInstruction: resolvedInstruction,
+        claude,
+        logger,
+        context,
+        model: nodeModel,
+        signal,
+        timeoutMs,
+      });
+      currentInstruction = `${preamble}\n\n---\n\n${instruction}`;
+      safeObserve(
+        observer,
+        { type: "node:retry", node: currentId, attempt: attempt + 1, reason: outcome.error ?? "eval failed", preamble },
+        logger,
+      );
+      attempt++;
+    }
+
+    // Fail-soft: when the node declares `fail_soft: true` and the failure was
+    // agent-level (max turns, early termination, SDK error), downgrade to
+    // success so the workflow proceeds with whatever partial output exists
+    // instead of failing outright. The original error stays in `data.error`
+    // and `data.fail_soft` marks the downgrade for downstream nodes and
+    // observers. Eval failures never take this path (agentRunFailed guards it).
+    if (agentRunFailed && result.status === "failed" && node.fail_soft === true) {
+      const failError = (result.data as Record<string, unknown> | undefined)?.error;
+      logger.warn(
+        `  fail_soft: node failed (${String(failError ?? "unknown error")}); continuing with partial output`,
+        {
+          node: currentId,
+        },
+      );
+      result = {
+        ...result,
+        status: "success",
+        data: { ...((result.data as Record<string, unknown> | undefined) ?? {}), fail_soft: true },
+      };
+    }
+
+    results.set(currentId, result);
+    trace.steps.push(
+      attempt > 0
+        ? { node: currentId, status: result.status, iteration, retryAttempt: attempt }
+        : { node: currentId, status: result.status, iteration },
+    );
+    safeObserve(observer, { type: "node:exit", node: currentId, result }, logger);
+    logger.info(`  ✓ ${result.status}`, { node: currentId, toolCalls: result.toolCalls.length });
+
+    // Dry run gate + routing — shared with requires path via advanceFromNode helper.
+    currentId = await advanceFromNode(
+      workflow,
+      currentId,
+      results,
+      input,
+      claude,
+      observer,
+      edgeCounts,
+      logger,
+      trace,
+      {
+        signal,
+        timeoutMs,
+      },
+    );
+  }
+
+  safeObserve(
+    observer,
+    {
+      type: "workflow:end",
+      results: Object.fromEntries(results),
+    },
+    logger,
+  );
+
+  return { results, trace };
+}
+
+// ─── Internals ───────────────────────────────────────────────────
+
+/**
+ * Build the full instruction for a node.
+ *
+ * Assembly order (each section separated by `---`):
+ *   1. Rules (from runtime input + workflow + node, cascaded)
+ *   2. Context (from runtime input + workflow + node, cascaded)
+ *   3. Skill instructions (one per skill with an `instruction` field)
+ *   4. The node's base instruction
+ *
+ * Preserves the legacy `input.additionalContext` fallback for callers
+ * that predate the Source-based rules/context fields.
+ */
+function buildNodeInstruction(
+  baseInstruction: string,
+  effectiveRules: string,
+  effectiveContext: string,
+  input: unknown,
+  skillInstructions?: { name: string; instruction: string }[],
+): string {
+  const sections: string[] = [];
+
+  if (effectiveRules) {
+    sections.push(`## Rules — You MUST Follow These\n\n${effectiveRules}`);
+  }
+  if (effectiveContext) {
+    sections.push(`## Background Context\n\n${effectiveContext}`);
+  }
+
+  // Legacy fallback for `input.additionalContext` when no rules/context cascaded
+  if (sections.length === 0) {
+    const inp = input as Record<string, unknown> | null;
+    const legacy = inp && typeof inp.additionalContext === "string" ? inp.additionalContext : "";
+    if (legacy) {
+      sections.push(`## Additional Context & Rules\n\n${legacy}`);
+    }
+  }
+
+  if (skillInstructions && skillInstructions.length > 0) {
+    for (const { name, instruction } of skillInstructions) {
+      sections.push(`## Skill: ${name}\n\n${instruction}`);
+    }
+  }
+
+  if (sections.length === 0) return baseInstruction;
+  return `${sections.join("\n\n---\n\n")}\n\n---\n\n${baseInstruction}`;
+}
+
+/**
+ * Normalize a NodeSources value into { sources, only }.
+ * - Array form → additive (only = false)
+ * - Object form → use its `only` and `sources`
+ * - undefined → empty additive
+ */
+const DEFAULT_JUDGE_BUDGET = 50;
+
+/**
+ * Soft cap on judge calls per workflow run. Logs a warn when the count of
+ * declared `kind: judge` evaluators exceeds the configured budget. This is
+ * a load-time signal only; the executor does not refuse to run.
+ *
+ * Each judge counts once per node visit, but the executor counts judges
+ * once at declaration time (a fan-out of repeated visits via cycles is the
+ * author's responsibility, not core's).
+ */
+function warnOnJudgeBudget(workflow: Workflow, logger: Logger): void {
+  const budget = workflow.judge_budget ?? DEFAULT_JUDGE_BUDGET;
+  let total = 0;
+  for (const node of Object.values(workflow.nodes)) {
+    for (const evaluator of node.eval ?? []) {
+      if (evaluator.kind === "judge") total++;
+    }
+  }
+  if (total > budget) {
+    logger.warn(
+      `Workflow declares ${total} judge evaluators across all nodes (budget: ${budget}). ` +
+        `Consider reducing the count or raising 'judge_budget' on the workflow. ` +
+        `Each judge adds one model call per node attempt.`,
+      { judgeCount: total, judgeBudget: budget },
+    );
+  }
+}
+
+/**
+ * Build the context-map entry for a single prior node.
+ *
+ * Spec contract (https://spec.sweny.ai/nodes/#evalresult-type): downstream
+ * nodes can read `priorNode.evals.<name>.pass` via the natural lookup path.
+ * To honor this without breaking back-compat with workflows that read
+ * `priorNode.<dataField>` directly, we spread `data` first and then attach
+ * an `evals` namespace keyed by evaluator name. If the agent's structured
+ * output happens to include a literal `evals` field, that field wins (and
+ * the lookup degrades to "evals not available" for downstream readers).
+ */
+function buildPriorNodeContext(result: NodeResult): Record<string, unknown> {
+  const data = (result.data ?? {}) as Record<string, unknown>;
+  const evals = result.evals ?? [];
+  if (evals.length === 0) return data;
+
+  const evalsByName: Record<string, unknown> = {};
+  for (const e of evals) {
+    evalsByName[e.name] = e;
+  }
+  // Spread evals first so a data-side `evals` key shadows it (back-compat).
+  return { evals: evalsByName, ...data };
+}
+
+/**
+ * Build the prior-node entry shown to the LLM route evaluator.
+ *
+ * Differs from `buildPriorNodeContext` (which feeds downstream node `run()`
+ * calls) in one way: when the source node declared an `output` schema with
+ * a `properties` block, the data view is restricted to those declared
+ * properties. The `evals` namespace is always preserved when present.
+ *
+ * Why this exists. The route evaluator is a natural-language model. Anything
+ * it sees in the context can sway the decision, including prose narrative
+ * fields like the always-injected `summary` from the reference Claude
+ * client (claude.ts: `data: { summary: response, ...parsed }`). Real-world
+ * symptom: a node correctly emits `status: "pass"` but also adds a
+ * conversational `summary` like "the quality_retry_count is 1", and the
+ * evaluator pattern-matches the retry mention to flip the routing decision.
+ *
+ * The fix is to treat the `output` schema as the routing contract. If the
+ * author declared which fields matter, only those reach the route
+ * evaluator. When no schema is declared we fall back to the full data
+ * (back-compat for workflows without structured outputs).
+ *
+ * The downstream node prompt is untouched: nodes still see the full prior
+ * `data` including any prose `summary`, so workflows that consume the
+ * narrative in subsequent steps keep working.
+ */
+function buildRouteEvalEntry(
+  result: NodeResult,
+  sourceNode: Node | undefined,
+): { view: Record<string, unknown>; missing: string[] } {
+  const fullData = (result.data ?? {}) as Record<string, unknown>;
+  const declaredProps = getDeclaredOutputProperties(sourceNode?.output);
+
+  // When the source node declared an `output.properties` block, the routing
+  // view is contract-shaped: every declared property is present in the
+  // view, with an explicit `null` when the agent did not emit it. The
+  // alternative (silently dropping the key) lets the LLM evaluator
+  // ghost-match conditions like "is 0", "is N", or "is undefined" against
+  // a structurally-absent field. That was the offload release-notes field
+  // bug: an optional `quality_retry_count` declared in the schema but
+  // omitted by the agent, evaluated against a condition like
+  // `quality_retry_count is 0 OR is undefined`, took the wrong branch.
+  //
+  // Returning `missing` separately lets the caller emit a loud warning so
+  // operators see the contract violation in the log stream.
+  let dataView: Record<string, unknown>;
+  const missing: string[] = [];
+  if (declaredProps) {
+    dataView = {};
+    for (const k of declaredProps) {
+      if (k in fullData) {
+        dataView[k] = fullData[k];
+      } else {
+        dataView[k] = null;
+        missing.push(k);
+      }
+    }
+  } else {
+    dataView = fullData;
+  }
+
+  const evals = result.evals ?? [];
+  if (evals.length === 0) return { view: dataView, missing };
+
+  const evalsByName: Record<string, unknown> = {};
+  for (const e of evals) {
+    evalsByName[e.name] = e;
+  }
+  // Spread evals first so a data-side `evals` key shadows it (back-compat).
+  return { view: { evals: evalsByName, ...dataView }, missing };
+}
+
+/**
+ * Return the declared output property names for a node, or null when the
+ * node has no `output` schema or its schema does not declare a `properties`
+ * block. Null signals "no contract" and routing falls back to the full
+ * data view.
+ *
+ * Tolerant of malformed schemas because `output` is `JSONSchema =
+ * Record<string, unknown>` and is not parsed further by the executor.
+ */
+function getDeclaredOutputProperties(output: JSONSchema | undefined): Set<string> | null {
+  if (!output || typeof output !== "object") return null;
+  const props = (output as Record<string, unknown>).properties;
+  if (!props || typeof props !== "object") return null;
+  const keys = Object.keys(props as Record<string, unknown>);
+  if (keys.length === 0) return null;
+  return new Set(keys);
+}
+
+/**
+ * Return the declared `required` field names for a node's output schema,
+ * or an empty array when no required block is declared. Tolerant of
+ * malformed schemas (mirrors getDeclaredOutputProperties).
+ */
+function getDeclaredRequiredFields(output: JSONSchema | undefined): string[] {
+  if (!output || typeof output !== "object") return [];
+  const required = (output as Record<string, unknown>).required;
+  if (!Array.isArray(required)) return [];
+  return required.filter((r): r is string => typeof r === "string");
+}
+
+/**
+ * Validate a node's emitted data against the declared output schema's
+ * required fields. Returns the list of required-but-missing field names.
+ *
+ * This is intentionally narrow: we do NOT do full JSON Schema validation.
+ * The routing impact comes from required fields being absent, so that's
+ * what we check. Type mismatches, format violations, additionalProperties
+ * etc. stay the workflow author's problem.
+ */
+function findMissingRequiredFields(data: unknown, output: JSONSchema | undefined): string[] {
+  const required = getDeclaredRequiredFields(output);
+  if (required.length === 0) return [];
+  const obj = (data ?? {}) as Record<string, unknown>;
+  return required.filter((k) => !(k in obj));
+}
+
+function nodeSourcesToArray(ns: NodeSources | undefined): { sources: Source[]; only: boolean } {
+  if (!ns) return { sources: [], only: false };
+  if (Array.isArray(ns)) return { sources: ns, only: false };
+  return { sources: ns.sources, only: !!ns.only };
+}
+
+/**
+ * Extract rules/context Sources from runtime input.
+ *
+ * Runtime input is typed `unknown` because workflows are polymorphic.
+ * We accept `Source`, `Source[]`, or undefined. A single string is
+ * classified via the usual Source prefix rules (inline by default).
+ * Invalid shapes are ignored — input is caller-controlled and the
+ * rest of the executor validates it elsewhere.
+ */
+function extractRuntimeInputSources(input: unknown, field: "rules" | "context"): Source[] {
+  if (!input || typeof input !== "object") return [];
+  const v = (input as Record<string, unknown>)[field];
+  if (v == null) return [];
+  if (Array.isArray(v)) return v as Source[];
+  if (typeof v === "string") return [v as Source];
+  if (typeof v === "object") return [v as Source]; // tagged form {inline}/{file}/{url}
+  return [];
+}
+
+/**
+ * Assemble the effective rules or context for a node per cascade semantics:
+ *   runtime input  +  workflow-level  +  node-level
+ * unless the node sets `only: true` for that field, which discards input
+ * and workflow contributions and uses only the node's own sources.
+ *
+ * Returns the concatenated resolved content (empty string when nothing applies).
+ */
+function assembleCascaded(
+  field: "rules" | "context",
+  nodeId: string,
+  node: Node,
+  inputCount: number,
+  workflowCount: number,
+  resolved: Record<string, ResolvedSource>,
+): string {
+  const { sources: nodeSources, only } = nodeSourcesToArray(node[field]);
+  const parts: string[] = [];
+
+  if (!only) {
+    for (let i = 0; i < inputCount; i++) parts.push(resolved[`input.${field}.${i}`]?.content ?? "");
+    for (let i = 0; i < workflowCount; i++) parts.push(resolved[`workflow.${field}.${i}`]?.content ?? "");
+  }
+  for (let i = 0; i < nodeSources.length; i++) {
+    parts.push(resolved[`nodes.${nodeId}.${field}.${i}`]?.content ?? "");
+  }
+
+  return parts.filter((s) => s.length > 0).join("\n\n");
+}
+
+/**
+ * Call observer without letting exceptions crash the workflow.
+ *
+ * Accepts a typed ExecutionEvent so TypeScript catches mistakes in
+ * event construction at compile time rather than silently at runtime.
+ */
+function safeObserve(observer: Observer | undefined, event: ExecutionEvent, logger?: Logger): void {
+  if (!observer) return;
+  try {
+    observer(event);
+  } catch (err: any) {
+    (logger ?? consoleLogger).warn(`Observer error (non-fatal): ${err.message}`);
+  }
+}
+
+/**
+ * Merge inline workflow skill definitions into the skill map.
+ * Inline skills (from workflow.skills) become Skill objects with empty tools/config.
+ * The caller's skill map takes precedence — inline skills only fill gaps.
+ */
+function mergeInlineSkills(
+  skills: Map<string, Skill>,
+  inlineSkills?: Record<string, SkillDefinition>,
+): Map<string, Skill> {
+  if (!inlineSkills || Object.keys(inlineSkills).length === 0) return skills;
+
+  const merged = new Map(skills);
+  for (const [id, def] of Object.entries(inlineSkills)) {
+    if (merged.has(id)) continue; // caller-provided skill takes precedence
+    merged.set(id, {
+      id,
+      name: def.name ?? id,
+      description: def.description ?? `Inline skill: ${id}`,
+      category: "general",
+      config: {},
+      tools: [],
+      instruction: def.instruction,
+      mcp: def.mcp,
+    });
+  }
+  return merged;
+}
+
+function resolveTools(skillIds: string[], skills: Map<string, Skill>): Tool[] {
+  return skillIds
+    .map((id) => skills.get(id))
+    .filter((s): s is Skill => s != null)
+    .flatMap((s) => s.tools);
+}
+
+/**
+ * Apply a node's optional skill-tool filter (`tools.allow` / `tools.deny`).
+ *
+ * - No filter declared: all resolved tools pass through (back-compat).
+ * - `allow` present: only tools whose name is in `allow` survive.
+ * - `deny` present: tools whose name is in `deny` are removed. Applied
+ *   after `allow` when both are declared, so deny always wins.
+ *
+ * Filter entries that match no resolved tool get a warn (typo detection;
+ * also fires legitimately when a skill is unconfigured and its tools are
+ * absent, which is informational rather than fatal).
+ */
+function filterNodeTools(tools: Tool[], filter: NodeToolFilter | undefined, nodeId: string, logger: Logger): Tool[] {
+  if (!filter) return tools;
+
+  const resolvedNames = new Set(tools.map((t) => t.name));
+  for (const name of [...(filter.allow ?? []), ...(filter.deny ?? [])]) {
+    if (!resolvedNames.has(name)) {
+      logger.warn(`  tools filter: '${name}' does not match any tool resolved for node '${nodeId}'`, {
+        node: nodeId,
+        tool: name,
+      });
+    }
+  }
+
+  const allow = filter.allow ? new Set(filter.allow) : null;
+  const deny = new Set(filter.deny ?? []);
+  return tools.filter((t) => (allow ? allow.has(t.name) : true) && !deny.has(t.name));
+}
+
+/** Collect instruction strings from skills that have them, in array order. */
+function resolveSkillInstructions(
+  skillIds: string[],
+  skills: Map<string, Skill>,
+): { name: string; instruction: string }[] {
+  return skillIds
+    .map((id) => skills.get(id))
+    .filter((s): s is Skill => s != null && s.instruction != null)
+    .map((s) => ({ name: s.name, instruction: s.instruction! }));
+}
+
+/**
+ * Resolve config values: check explicit overrides first, then env vars.
+ * Throws if a required field is missing.
+ *
+ * `env` is the environment map to read `field.env` from. Callers thread
+ * `options.env ?? process.env` so an explicit env map is honored consistently
+ * with Source resolution (which reads the same map). Defaults to
+ * `process.env` when omitted.
+ *
+ * Presence vs. truthiness: an explicitly-provided empty string is treated as
+ * present, not absent. Resolution rules:
+ *   - An override that is present (any string, including "") wins; the env
+ *     var is not consulted. An explicit "" override does NOT silently fall
+ *     through to env.
+ *   - Otherwise the env var (when declared) is used.
+ *   - A value that is `undefined` (no override, no env var) is absent: a
+ *     required field reports "not provided".
+ *   - A value that is "" is present-but-empty: a required field reports a
+ *     distinct "set to empty" message (you set it, but to an unusable value),
+ *     while an optional field passes the empty string through.
+ */
+function resolveConfig(
+  skills: Map<string, Skill>,
+  overrides?: Record<string, string>,
+  env: NodeJS.ProcessEnv = process.env,
+): Record<string, string> {
+  const config: Record<string, string> = {};
+  const missing: string[] = [];
+
+  for (const skill of skills.values()) {
+    for (const [key, field] of Object.entries(skill.config)) {
+      // Explicit override wins, including an empty string — `in` distinguishes
+      // a present "" from an absent key, so an override never falls through to
+      // env in a surprising way.
+      const hasOverride = overrides != null && key in overrides;
+      const value = hasOverride ? overrides![key] : field.env ? env[field.env] : undefined;
+      const source = field.env ? ` (env: ${field.env})` : "";
+
+      const label = `${skill.id}.${key}${source || " (env: none)"}`;
+      if (value === undefined) {
+        // Truly absent: no override and no env value.
+        if (field.required) {
+          missing.push(`${label}: not provided`);
+        }
+      } else if (value === "") {
+        // Present but empty. An empty credential is unusable for a required
+        // field; surface a distinct message so the user can tell "set to empty"
+        // from "forgot it". Optional empty values pass through unchanged.
+        if (field.required) {
+          missing.push(`${label}: set to empty`);
+        } else {
+          config[key] = value;
+        }
+      } else {
+        config[key] = value;
+      }
+    }
+  }
+
+  if (missing.length > 0) {
+    throw new Error(`Missing required config:\n  ${missing.join("\n  ")}`);
+  }
+
+  return config;
+}
+
+/**
+ * Apply the dry-run gate and then resolve the next node via edge conditions.
+ *
+ * Used in both the normal execution path and the requires-failure path so
+ * the dry-run guard + resolveNext + trace-edge recording logic lives in one place.
+ *
+ * Returns the next node ID, or null when execution should stop.
+ */
+async function advanceFromNode(
+  workflow: Workflow,
+  currentId: string,
+  results: Map<string, NodeResult>,
+  input: unknown,
+  claude: Claude,
+  observer: Observer | undefined,
+  edgeCounts: Map<string, number>,
+  logger: Logger,
+  trace: ExecutionTrace,
+  abort?: AbortOptions,
+): Promise<string | null> {
+  // Dry run hard gate — stop at the first conditional routing decision.
+  // Unconditional edges are analysis flow (prepare→gather→investigate);
+  // conditional edges are action decisions (investigate→create_issue/skip).
+  // Enforced in the executor so it cannot be bypassed by LLM evaluation.
+  const isDryRun = input && typeof input === "object" && (input as Record<string, unknown>).dryRun === true;
+  if (isDryRun) {
+    const outEdges = workflow.edges.filter((e) => e.from === currentId);
+    if (outEdges.some((e) => e.when)) {
+      safeObserve(observer, { type: "route", from: currentId, to: "(end)", reason: "dry run" }, logger);
+      return null;
+    }
+  }
+
+  const prevId = currentId;
+  const nextId = await resolveNext(workflow, currentId, results, input, claude, observer, edgeCounts, logger, abort);
+  if (nextId) {
+    const reason = workflow.edges.find((e) => e.from === prevId && e.to === nextId)?.when ?? "only path";
+    trace.edges.push({ from: prevId, to: nextId, reason });
+  }
+  return nextId;
+}
+
+/**
+ * Resolve which edge to follow from the current node.
+ *
+ * - 0 out-edges → terminal (return null)
+ * - 1 unconditional edge → follow it
+ * - Multiple or conditional → Claude evaluates
+ *
+ * Edges with max_iterations are filtered out once exhausted.
+ */
+async function resolveNext(
+  workflow: Workflow,
+  current: string,
+  results: Map<string, NodeResult>,
+  input: unknown,
+  claude: Claude,
+  observer?: Observer,
+  edgeCounts?: Map<string, number>,
+  logger?: Logger,
+  abort?: AbortOptions,
+): Promise<string | null> {
+  // Filter out edges that have exceeded their max_iterations
+  const outEdges = workflow.edges.filter((e) => {
+    if (e.from !== current) return false;
+    if (e.max_iterations && edgeCounts) {
+      const key = `${e.from}→${e.to}`;
+      const count = edgeCounts.get(key) ?? 0;
+      if (count >= e.max_iterations) return false;
+    }
+    return true;
+  });
+
+  if (outEdges.length === 0) return null;
+
+  // Single unconditional edge — just follow it
+  if (outEdges.length === 1 && !outEdges[0].when) {
+    if (edgeCounts) {
+      const key = `${current}→${outEdges[0].to}`;
+      edgeCounts.set(key, (edgeCounts.get(key) ?? 0) + 1);
+    }
+    safeObserve(observer, { type: "route", from: current, to: outEdges[0].to, reason: "only path" }, logger);
+    return outEdges[0].to;
+  }
+
+  // Check for a default (unconditional) edge among conditionals
+  const defaultEdge = outEdges.find((e) => !e.when);
+  const conditionalEdges = outEdges.filter((e) => e.when);
+
+  // Defense-in-depth for AMBIGUOUS_EDGES (rejected by validateWorkflow): with
+  // no conditional edges there is nothing for the route evaluator to decide.
+  // Follow the (first) unconditional edge directly and skip the no-op
+  // claude.evaluate call. validateWorkflow already rejects 2+ unconditional
+  // edges, so a well-formed workflow reaching here has exactly one default.
+  if (conditionalEdges.length === 0 && defaultEdge) {
+    if (outEdges.length > 1) {
+      logger?.warn(
+        `  route eval: node '${current}' has ${outEdges.length} unconditional out-edges; following '${defaultEdge.to}' ` +
+          `and ignoring the rest. Add 'when' clauses to make routing deterministic (see AMBIGUOUS_EDGES).`,
+        { node: current },
+      );
+    }
+    if (edgeCounts) {
+      const key = `${current}→${defaultEdge.to}`;
+      edgeCounts.set(key, (edgeCounts.get(key) ?? 0) + 1);
+    }
+    safeObserve(observer, { type: "route", from: current, to: defaultEdge.to, reason: "only path" }, logger);
+    return defaultEdge.to;
+  }
+
+  // Claude evaluates which condition matches. Include input so conditions
+  // can reference workflow-level flags like dryRun, and expose evals so
+  // routing edges can read `priorNode.evals.X.pass`.
+  //
+  // Crucial difference from the run() context: when a prior node declared
+  // an `output` schema, the routing view of its data is restricted to the
+  // declared properties. Without this, non-schema fields (notably the
+  // always-injected `summary` prose from the reference Claude client) can
+  // sway the natural-language route evaluator and override the actual
+  // structured result. See `buildRouteEvalEntry` for the full rationale.
+  const context: Record<string, unknown> = { input };
+  for (const [k, v] of results.entries()) {
+    const { view, missing } = buildRouteEvalEntry(v, workflow.nodes[k]);
+    context[k] = view;
+    // Only a successful node has an output contract to violate. A node that
+    // was skipped (requires not met) or failed before producing output never
+    // emitted its declared properties; its data is { skipped_reason } / { error }.
+    // Warning that those nodes are "missing declared properties" is misleading
+    // noise — it alarms operators and pollutes telemetry on every skip. Still
+    // build the view above so routing can read the skipped/failed data; only
+    // suppress the warning + node:warning for non-success nodes.
+    if (missing.length > 0 && v.status === "success") {
+      // Loud signal for the operator. The view itself already replaces the
+      // missing keys with explicit `null`, so the LLM evaluator cannot
+      // ghost-match "is N" or "is undefined" against a structurally-absent
+      // field. The warning surfaces the contract violation in the log
+      // stream and to observer-based telemetry.
+      logger?.warn(`  route eval: source node '${k}' declared properties not in emitted data: ${missing.join(", ")}`, {
+        node: k,
+        fields: missing,
+      });
+      safeObserve(
+        observer,
+        {
+          type: "node:warning",
+          node: k,
+          reason: `declared output properties missing from emitted data; routing view filled them with null`,
+          fields: missing,
+        },
+        logger,
+      );
+    }
+  }
+
+  const choices = conditionalEdges.map((e) => ({
+    id: e.to,
+    description: e.when!,
+  }));
+
+  if (defaultEdge) {
+    choices.push({ id: defaultEdge.to, description: "None of the above / default path" });
+  }
+
+  const chosen = await claude.evaluate({
+    question: "Based on the results so far, which condition is true?",
+    context,
+    choices,
+    signal: abort?.signal,
+    timeoutMs: abort?.timeoutMs,
+  });
+
+  // Validate that Claude returned a valid target.
+  const validTargets = new Set(outEdges.map((e) => e.to));
+  if (!validTargets.has(chosen)) {
+    // The evaluator returned a target that is not a live out-edge. If there's
+    // an explicit default (unconditional) edge, take it as the documented
+    // fallback. Otherwise this is a hard error: silently jumping to
+    // `outEdges[0]` (often the loop-back edge) launders garbage model output
+    // into a plausible-looking route and, combined with an unbounded cycle,
+    // produces an infinite loop. Stop loudly instead.
+    if (!defaultEdge) {
+      logger?.warn(
+        `  route eval: evaluator returned invalid target '${chosen}' for node '${current}' and there is no ` +
+          `default (unconditional) edge; terminating this branch. Valid targets: ${[...validTargets].join(", ")}`,
+        { node: current, chosen, validTargets: [...validTargets] },
+      );
+      safeObserve(
+        observer,
+        {
+          type: "route",
+          from: current,
+          to: "(end)",
+          reason: `invalid route target '${chosen}' with no default edge`,
+        },
+        logger,
+      );
+      return null;
+    }
+  }
+
+  const resolved = validTargets.has(chosen) ? chosen : defaultEdge!.to;
+
+  // Track edge usage for max_iterations
+  if (edgeCounts) {
+    const key = `${current}→${resolved}`;
+    edgeCounts.set(key, (edgeCounts.get(key) ?? 0) + 1);
+  }
+
+  // Report the matched choice's description. The `?? "default"` fallback now
+  // only fires when a default edge genuinely exists (the no-default invalid
+  // case returned null above), so it can no longer mislabel a garbage route.
+  safeObserve(
+    observer,
+    {
+      type: "route",
+      from: current,
+      to: resolved,
+      reason: choices.find((c) => c.id === resolved)?.description ?? "default",
+    },
+    logger,
+  );
+
+  return resolved;
+}
+
+/**
+ * Validate a workflow definition before execution.
+ */
+function validate(workflow: Workflow, skills: Map<string, Skill>): void {
+  if (!workflow.nodes[workflow.entry]) {
+    throw new Error(`Entry node "${workflow.entry}" not found`);
+  }
+
+  for (const edge of workflow.edges) {
+    if (!workflow.nodes[edge.from]) throw new Error(`Edge references unknown node: "${edge.from}"`);
+    if (!workflow.nodes[edge.to]) throw new Error(`Edge references unknown node: "${edge.to}"`);
+  }
+
+  // Check that each node has at least one available skill (if it lists any)
+  for (const [nodeId, node] of Object.entries(workflow.nodes)) {
+    if (node.skills.length === 0) continue;
+    const available = node.skills.filter((id) => skills.has(id));
+    if (available.length === 0) {
+      consoleLogger.warn(`Node "${nodeId}" has no available skills (needs one of: ${node.skills.join(", ")})`);
+    }
+  }
+}

@@ -1,0 +1,793 @@
+---
+title: Nodes
+description: The Node object and its execution semantics.
+---
+
+A Node represents a single step in a [Workflow](/workflow). Each node contains a natural language instruction that an AI model executes, with access to tools from declared [Skills](/skills).
+
+## Fields
+
+| Field              | Type                             | Required | Default                        | Description                                                                                                    |
+| ------------------ | -------------------------------- | -------- | ------------------------------ | -------------------------------------------------------------------------------------------------------------- |
+| `name`             | string                           | REQUIRED | —                              | Display name for this node. MUST be non-empty.                                                                 |
+| `instruction`      | [Source](/sources)               | REQUIRED | —                              | Natural language instruction for the AI model. MUST be non-empty.                                              |
+| `skills`           | string[]                         | OPTIONAL | `[]`                           | Skill IDs this node has access to.                                                                             |
+| `output`           | JSON Schema object               | OPTIONAL | —                              | Structured output schema for this node's result.                                                               |
+| `max_turns`        | integer &ge; 1                   | OPTIONAL | implementation&#8209;defined   | Maximum AI model turns for this node's execution.                                                              |
+| `model`            | string                           | OPTIONAL | inherited / impl&#8209;defined | Execution model for this node's AI invocation. Free-text passthrough. See [Model Selection](#model-selection). |
+| `disallowed_tools` | string[]                         | OPTIONAL | `[]`                           | Built-in agent tools removed from the model context at this node. See [Disallowed Tools](#disallowed-tools).   |
+| `tools`            | [ToolFilter](#tool-filter)       | OPTIONAL | all skill tools                | Allowlist/denylist over skill-provided tools at this node. See [Tool Filter](#tool-filter).                    |
+| `fail_soft`        | boolean                          | OPTIONAL | `false`                        | Downgrade an agent-level failure to success and proceed with partial output. See [Fail Soft](#fail-soft).      |
+| `rules`            | [NodeSources](#nodesources-type) | OPTIONAL | inherited                      | Rules for this node. Additive by default; see [cascade](#cascade-semantics).                                   |
+| `context`          | [NodeSources](#nodesources-type) | OPTIONAL | inherited                      | Context for this node. Additive by default; see [cascade](#cascade-semantics).                                 |
+| `eval`             | [Eval](#eval)                    | OPTIONAL | —                              | Named evaluators (value, function, judge) run after the AI finishes the node.                                  |
+| `eval_policy`      | string                           | OPTIONAL | `all_pass`                     | How to aggregate evaluator results. v1 supports `all_pass`.                                                    |
+| `requires`         | [Requires](#requires)            | OPTIONAL | —                              | Machine-checked pre-conditions evaluated before the AI starts the node.                                        |
+| `retry`            | [Retry](#retry)                  | OPTIONAL | —                              | Node-local retry on eval failure with optional autonomous reflection.                                          |
+
+## Max Turns Semantics
+
+The `max_turns` field limits how many AI model turns (request-response cycles) a node may consume. Each turn is one model invocation — a turn that produces tool calls and a turn that produces a final response both count.
+
+A conforming executor:
+
+- **MUST** enforce `max_turns` when present, stopping the model after the specified number of turns.
+- When `max_turns` is absent, the executor applies its own default. The default is **implementation-defined**.
+- When the limit is reached, the executor **SHOULD** capture whatever partial result is available and produce a `NodeResult` with `status: "failed"` and a descriptive error in `data`. The executor **MUST NOT** silently discard the node's work.
+
+Different nodes have vastly different compute needs. A context-gathering node that queries multiple APIs may need many turns, while a summarization node with no tools may need one. Per-node limits give workflow authors fine-grained control over the compute budget.
+
+## Model Selection
+
+The optional `model` field selects which AI model executes a node. It is the execution-time counterpart to the judge `model` / `judge_model` fields, which select the model for [evaluation](#judge-mechanics).
+
+Resolution is a cascade, narrowest wins:
+
+1. Node-level `model`.
+2. Workflow-level `model`.
+3. The executor's implementation-defined default model.
+
+A conforming executor:
+
+- **MUST** forward the resolved model to the AI invocation (step 6 of the [Node Execution Sequence](/execution)) when any layer specifies one.
+- **MUST** fall back to its implementation-defined default model when no layer specifies one. The executor **MUST NOT** invent a hardcoded model name in the spec.
+- **MUST NOT** validate `model` against a registry or allowlist. The value is free-text passed through verbatim, consistent with `judge_model`. Model availability and naming are the responsibility of the backend (or gateway) the executor targets.
+
+`model` is independent of `judge_model`: one selects the execution model, the other the evaluation model. A node MAY set both. The common use is cost tiering: a cheap model on mechanical grunt nodes (lint, format, summarize) and a stronger model on the reasoning nodes.
+
+## Disallowed Tools
+
+The `disallowed_tools` field names built-in agent tools the AI model MUST NOT have access to at this node. Names refer to the agent runtime's built-in tools (e.g. `Bash`, `Read`, `Edit`, `Write`, `WebFetch`, `WebSearch`), not to skill-provided tool names declared in [Skills](/skills).
+
+Typical use: keep an `implement` node focused on the repo by removing `WebFetch` and `WebSearch`, or harden a notification node by removing `Bash` so the agent cannot shell out.
+
+A conforming executor:
+
+- **MUST** prevent the model from invoking any tool listed in `disallowed_tools` for the duration of this node's run.
+- **SHOULD** remove the named tools from the model's context entirely, rather than rejecting calls after the fact, so the model does not waste turns attempting blocked tools.
+- **MUST NOT** apply `disallowed_tools` to skill-provided tools registered via `skills`. Skills are gated by their own declaration (only listed `skills` are available); `disallowed_tools` is exclusively for built-in agent tools.
+- When the field is absent or empty, the executor applies its default tool set with no removals.
+
+```yaml
+implement:
+  name: Implement Fix
+  instruction: Read the issue, write the fix, run tests, commit.
+  skills:
+    - github
+  disallowed_tools:
+    - WebFetch
+    - WebSearch
+```
+
+The exact set of names the runtime recognizes is **implementation-defined** and tracks the agent SDK in use. Workflow authors SHOULD verify a name is honored before relying on it; a typo silently no-ops because there is no built-in tool of that name to remove.
+
+## Tool Filter
+
+The `tools` field restricts which skill-provided tools are exposed at this node. It is the skill-tool counterpart to [`disallowed_tools`](#disallowed-tools), which covers built-in agent tools only.
+
+| Field   | Type     | Required | Description                                                              |
+| ------- | -------- | -------- | ------------------------------------------------------------------------ |
+| `allow` | string[] | OPTIONAL | When present, ONLY these skill tool names are exposed at this node.      |
+| `deny`  | string[] | OPTIONAL | These skill tool names are removed. Applied after `allow` when both set. |
+
+At least one of `allow` / `deny` MUST be declared when the field is present.
+
+A conforming executor:
+
+- **MUST NOT** register a filtered-out tool for the node's run. The model never sees the tool; this is structural enforcement, not call-time rejection.
+- **MUST** expose all skill tools unchanged when the field is absent (back-compat).
+- **SHOULD** warn when a filter entry matches no tool resolved for the node (typo detection; also fires when a skill is unconfigured).
+
+Typical use: a read-only context-gathering node that declares the `github` and `linear` skills for their search tools but must never create issues or pull requests:
+
+```yaml
+gather:
+  name: Gather Context
+  instruction: Collect context about the alert. Read-only.
+  skills:
+    - github
+    - linear
+  tools:
+    deny:
+      - linear_create_issue
+      - github_create_issue
+      - github_create_pr
+```
+
+## Fail Soft
+
+When `fail_soft: true` and the node fails at the agent level (turn cap reached, early termination, runtime error), the executor downgrades the result to `status: "success"`, sets `fail_soft: true` in the result data, preserves the original error under `data.error`, and proceeds with routing so downstream nodes can work with whatever partial output exists.
+
+A conforming executor:
+
+- **MUST** apply `fail_soft` only to agent-level failures. Eval failures are correctness gates and **MUST NOT** be softened.
+- **MUST** preserve the original error message in the result data.
+- **MUST** mark the downgrade (`fail_soft: true` in result data) so downstream nodes and observers can distinguish a soft-failed node from a genuinely successful one.
+- When the field is absent or `false`, a failed node fails the workflow as before.
+
+Typical use: a best-effort context-gathering node whose downstream consumer has its own tools and can compensate for incomplete context.
+
+## Rules & Context
+
+Nodes can declare their own `rules` and `context` that interact with the workflow-level declarations via cascade.
+
+### NodeSources Type
+
+Per-node `rules` and `context` accept two forms:
+
+**Array form** (additive — default):
+
+```yaml
+investigate:
+  name: Root Cause Analysis
+  instruction: Investigate the alert.
+  context:
+    - ./security-playbook.md
+```
+
+The node inherits all workflow-level sources AND adds its own.
+
+**Object form** (with `only` flag):
+
+```yaml
+vendor-review:
+  name: Vendor License Review
+  instruction: Check dependency licenses.
+  rules:
+    only: true
+    sources:
+      - ./license-policy.md
+```
+
+When `only: true`, the node does **not** inherit workflow-level sources for that field. Only the node's own sources are used. This blocks cascade for that field only — `context` still inherits normally unless it also sets `only: true`.
+
+### Cascade Semantics
+
+For each of `rules` and `context`, a conforming executor MUST resolve the effective sources for a node using this algorithm:
+
+1. Start with **runtime input** sources (if any).
+2. Append **workflow-level** sources (if any).
+3. If the node declares the field:
+   - **`only: true`** — discard steps 1–2, use only the node's `sources`.
+   - **Otherwise** (array form, or `only` absent/false) — append the node's sources.
+
+The resolved sources are concatenated in this order and prepended to the node's instruction. See [Input Augmentation](#input-augmentation) for the full assembly.
+
+```
+Effective rules   = (only? node-only : runtime + workflow + node)
+Effective context = (only? node-only : runtime + workflow + node)
+```
+
+### Example: Mixed Cascade
+
+```yaml
+# Workflow level
+rules:
+  - ./coding-standards.md
+context:
+  - ./ARCHITECTURE.md
+
+nodes:
+  gather:
+    name: Gather Context
+    instruction: Investigate the alert.
+    # No per-node rules/context — inherits everything from workflow
+
+  security-audit:
+    name: Security Audit
+    instruction: Audit for OWASP top 10.
+    # Additive — gets workflow context + this
+    context:
+      - ./security-playbook.md
+
+  license-check:
+    name: License Review
+    instruction: Check dependency licenses.
+    # Override — only these rules, no inheritance
+    rules:
+      only: true
+      sources:
+        - ./license-policy.md
+    # Context still inherits from workflow (ARCHITECTURE.md)
+```
+
+## Instruction Semantics
+
+The `instruction` field is the primary directive for the AI model at this step.
+
+A conforming executor:
+
+- **MUST** pass the instruction to the AI model as the primary directive.
+- **MUST NOT** alter, summarize, or truncate the instruction.
+- **MAY** augment the instruction with context from prior nodes (see [Execution Model](/execution)).
+
+### Input Augmentation
+
+A conforming executor MUST resolve rules and context from all three layers (runtime input, workflow-level, node-level) per the [cascade semantics](#cascade-semantics) above. The effective rules are prepended with the heading:
+
+```
+## Rules — You MUST Follow These
+
+{effective rules, concatenated}
+```
+
+The effective context is prepended with the heading:
+
+```
+## Background Context
+
+{effective context, concatenated}
+```
+
+### Skill Instruction Injection
+
+If any skill referenced by the node has an `instruction` field, a conforming executor MUST inject each skill's instruction into the prompt, in the order the skills appear in the node's `skills` array:
+
+```
+## Skill: {skill.name}
+
+{skill.instruction}
+```
+
+When rules, context, and skill instructions are all present, the assembly order is: rules first, then context, then skill instructions, then the node's base instruction, separated by `---`.
+
+```
+┌─────────────────────────────────┐
+│ ## Rules — You MUST Follow These│  ← effective rules (cascaded)
+│ {rules content}                 │
+├─────────────────────────────────┤
+│ ---                             │
+├─────────────────────────────────┤
+│ ## Background Context           │  ← effective context (cascaded)
+│ {context content}               │
+├─────────────────────────────────┤
+│ ---                             │
+├─────────────────────────────────┤
+│ ## Skill: {skill.name}          │  ← one per skill with instruction
+│ {skill.instruction}             │
+├─────────────────────────────────┤
+│ ---                             │
+├─────────────────────────────────┤
+│ {node.instruction}              │  ← the node's own instruction
+└─────────────────────────────────┘
+```
+
+### Externalizing Instructions
+
+Because `instruction` is a [Source](/sources), you can keep long or shared prompts in a file or URL and reference them by path:
+
+```yaml
+investigate:
+  name: Root Cause Analysis
+  instruction: ./prompts/investigate.md
+  skills:
+    - github
+    - linear
+```
+
+Or pin to a shared playbook repo:
+
+```yaml
+gather:
+  name: Gather Context
+  instruction: https://raw.githubusercontent.com/acme/playbook/main/gather.md
+```
+
+Files and URLs resolve **once**, eagerly, before any node runs. Resolved content is recorded in `trace.sources` with a content hash for audit.
+
+## Skills Semantics
+
+The `skills` array declares which [Skills](/skills) the node can access during execution.
+
+A conforming executor:
+
+- **MUST** resolve tools from the listed skill IDs and make them available to the AI model during node execution.
+- **MUST NOT** make tools available from skills not listed in the node's `skills` array.
+- **SHOULD** silently skip skills that are not configured (missing required config values) rather than failing the workflow. The node executes with whatever tools are available from the remaining skills.
+
+## Output Schema Semantics
+
+The `output` field declares a JSON Schema that the node's result data MUST conform to.
+
+A conforming executor:
+
+- **MUST** request structured output from the AI model conforming to this schema when `output` is present.
+- The structured output becomes the node's result data, available to downstream nodes via [context accumulation](/execution#context-accumulation).
+- When `output` is absent, the node's result data is implementation-defined.
+
+## Requires
+
+Machine-checked **pre-conditions**. Evaluated before the LLM runs. If any
+declared check fails, the node is marked failed (or skipped) and the LLM
+is never invoked.
+
+### Why
+
+Catch missing upstream context — bad runtime input, an upstream node that
+returned without producing a required field — before burning tokens. The
+checks are deterministic and run synchronously.
+
+### Schema
+
+```yaml
+requires:
+  output_required: [string] # paths must resolve, non-null/undefined
+  output_matches: [OutputMatch] # equals / in / matches
+  on_fail: fail | skip # default: fail
+```
+
+### Path roots
+
+Paths resolve against the cross-node context map:
+
+```
+{ input: <runtime input>, [priorNodeId]: <data of prior node>, ... }
+```
+
+The grammar is identical to [eval paths](#path-grammar): dotted segments,
+`[*]` wildcards, optional `all:` / `any:` prefix.
+
+| Path                            | Resolves to                                       |
+| ------------------------------- | ------------------------------------------------- |
+| `input.repoUrl`                 | The `repoUrl` field on the runtime input.         |
+| `triage.recommendation`         | `data.recommendation` of the prior `triage` node. |
+| `any:scan.findings[*].severity` | At least one finding has a non-null severity.     |
+
+### Failure modes
+
+| `on_fail`        | Result status | Result data                                   |
+| ---------------- | ------------- | --------------------------------------------- |
+| `fail` (default) | `failed`      | `{ error: "requires failed: ..." }`           |
+| `skip`           | `skipped`     | `{ skipped_reason: "requires not met: ..." }` |
+
+In both cases the LLM is not invoked. Routing continues normally — edges
+with `when` conditions can read the failure status and route around it.
+
+### Example
+
+```yaml
+nodes:
+  open_pr:
+    name: Open PR
+    instruction: Open a PR with the fix
+    skills: [github]
+    requires:
+      output_required:
+        - input.repoUrl
+        - implement_fix.branch
+      output_matches:
+        - { path: implement_fix.filesChanged, matches: "^[1-9]" }
+      on_fail: fail
+```
+
+## Eval
+
+The `eval` field declares a list of named **evaluators** the executor runs after the AI model finishes a node. Each evaluator produces an [EvalResult](#evalresult-type) with a `pass` verdict and optional reasoning. Under the default `eval_policy: all_pass`, every evaluator must pass for the node to pass; any failure marks the node failed and the workflow halts (or routes to the next failure edge).
+
+Eval catches the common "the model claims success without doing the work" failure mode: a tool was supposed to be called and wasn't, a required field is missing from the structured output, a value is outside the allowed set, or the result claims a contract it doesn't actually meet. It complements, and does not replace, [conditional edges](/edges#conditional-routing), which decide _where to go next_ based on the result.
+
+The shape mirrors how every other agent eval framework (LangSmith, Promptfoo, OpenAI Evals, DeepEval, Ragas) names this primitive. SWEny's three evaluator kinds map to the same three categories the field has converged on.
+
+### Schema
+
+```yaml
+nodes:
+  open_pr:
+    name: Open PR
+    instruction: Open a PR with the fix.
+    skills: [github]
+    eval:
+      - name: pr_was_created
+        kind: function
+        rule:
+          all_tools_called: [github_create_pr]
+      - name: pr_url_present
+        kind: value
+        rule:
+          output_required: [prUrl]
+    eval_policy: all_pass # default; can be omitted
+```
+
+Each entry in `eval` is an **Evaluator** with these fields:
+
+| Field       | Required                          | Applies to      | Description                                                                                                        |
+| ----------- | --------------------------------- | --------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `name`      | REQUIRED                          | all kinds       | Stable identifier for the evaluator. Used in result objects and retry preambles.                                   |
+| `kind`      | REQUIRED                          | all kinds       | One of `value`, `function`, `judge`.                                                                               |
+| `rule`      | REQUIRED for `value` / `function` | value, function | The deterministic rule. See per-kind shapes below.                                                                 |
+| `rubric`    | REQUIRED for `judge`              | judge           | Natural-language rubric the judge model evaluates against the node's data and trace.                               |
+| `pass_when` | OPTIONAL for `judge`              | judge           | Expected verdict word. Default `yes`. MUST be a single whitespace-free token; the judge response is parsed for it. |
+| `model`     | OPTIONAL for `judge`              | judge           | Override the judge model for this evaluator. See [Judge mechanics](#judge-mechanics).                              |
+
+A node with no `eval` field has no post-conditions; the node passes when the AI finishes without error.
+
+### The three kinds
+
+#### `value`: data-shape match
+
+Pure, deterministic, fast. Operates on the node's structured `output` (`result.data`). Use when you can express the contract as a path-and-operator check.
+
+The rule object accepts `output_required` and `output_matches`:
+
+```yaml
+eval:
+  - name: pr_url_well_formed
+    kind: value
+    rule:
+      output_required: [prUrl, branchName]
+      output_matches:
+        - { path: prUrl, matches: "^https://github.com/" }
+        - { path: branchName, matches: "^sweny/" }
+```
+
+`output_required` is a list of paths into `result.data` that must each resolve to a present, non-null value. `output_matches` is a list of [OutputMatch](#outputmatch-type) entries, each asserting `equals`, `in`, or `matches` against a path.
+
+A single `value` evaluator MAY combine both fields. They are AND-ed within the rule.
+
+#### `function`: trace-shape match
+
+Pure, deterministic, fast. Operates on the node's tool-call trace, not its data. Use when the contract is "the model did (or did not) call this tool."
+
+The rule object accepts `any_tool_called`, `all_tools_called`, and `no_tool_called`:
+
+```yaml
+eval:
+  - name: pr_was_created
+    kind: function
+    rule:
+      all_tools_called: [github_create_pr]
+      no_tool_called: [github_force_push]
+```
+
+A tool "was called and succeeded" when it appears in the node's tool-call trace with no error. For `no_tool_called`, _any_ appearance, successful or not, counts as a violation.
+
+The `function` kind is also the natural home for any future code-based check (for example, "the diff touched fewer than 10 files"). v1 covers tool-call assertions; the kind is intentionally named `function` rather than `tool_call` to leave that door open.
+
+#### `judge`: LLM-as-judge
+
+Calls a small Claude model with the node's data, the node's tool-call trace, and the author's rubric. The judge returns a single verdict word (default `yes` / `no`) plus a short reasoning string. Use when the contract is conditional, semantic, or otherwise outside the reach of a deterministic rule.
+
+```yaml
+eval:
+  - name: tests_present_when_pass_claimed
+    kind: judge
+    rubric: |
+      If result.data.test_status is "pass", does
+      result.data.test_files_changed contain at least one real test
+      file path? An empty array with status "pass" is a contract
+      violation. If status is anything else, this rule passes
+      vacuously.
+    pass_when: yes
+```
+
+The judge sees the node's `result.data`, the tool-call trace, and the rubric. It does not see runtime input or upstream node results unless you put them in the rubric explicitly.
+
+See [Judge mechanics](#judge-mechanics) for model selection, cost gating, and parse failures.
+
+### `eval_policy`
+
+How the executor aggregates evaluator results into a single node verdict.
+
+| Policy     | v1 status | Behavior                                                  |
+| ---------- | --------- | --------------------------------------------------------- |
+| `all_pass` | shipped   | Every evaluator must pass. Default.                       |
+| `any_pass` | reserved  | At least one evaluator must pass. Not implemented in v1.  |
+| `weighted` | reserved  | Sum of `score`s above a threshold. Not implemented in v1. |
+
+A conforming executor MUST accept `eval_policy: all_pass` and MAY reject other values until the corresponding semantics ship.
+
+### `EvalResult` type
+
+Each evaluator produces a structured result. The full list lands on `NodeResult.evals`:
+
+| Field       | Type                             | Description                                                                                                                                         |
+| ----------- | -------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `name`      | string                           | The evaluator's `name`.                                                                                                                             |
+| `kind`      | `value` \| `function` \| `judge` | The evaluator's `kind`.                                                                                                                             |
+| `pass`      | boolean                          | Whether this evaluator passed.                                                                                                                      |
+| `reasoning` | string (optional)                | Failure detail. Populated by the judge model on judge evaluators, by the executor's failure formatter on value/function. Capped at ~500 characters. |
+| `score`     | number (optional)                | Reserved for `weighted` aggregation. Not populated in v1.                                                                                           |
+
+Downstream nodes can read individual evaluator outcomes via context paths, e.g. `priorNode.evals.pr_was_created.pass`.
+
+### OutputMatch type
+
+| Field     | Type   | Required | Description                                                                                            |
+| --------- | ------ | -------- | ------------------------------------------------------------------------------------------------------ |
+| `path`    | string | REQUIRED | A path into `result.data` (see [Path grammar](#path-grammar)).                                         |
+| `equals`  | any    | one-of   | Strict deep equality against the resolved value.                                                       |
+| `in`      | any[]  | one-of   | The resolved value is in the array (deep equality per element).                                        |
+| `matches` | string | one-of   | A JavaScript regex source (no flags); the resolved value is coerced to a string and tested against it. |
+
+Exactly one of `equals`, `in`, or `matches` MUST be set per entry.
+
+### Path grammar
+
+A path is a `.`-separated sequence of segments. A segment is either:
+
+- An identifier matching `[a-zA-Z_][a-zA-Z0-9_]*` — object property access, OR
+- An identifier followed by `[*]` — wildcard expansion over an array.
+
+The path MAY be prefixed with `all:` or `any:` (see [Wildcard semantics](#wildcard-semantics)). When no prefix is present, `all:` is implied.
+
+Examples:
+
+| Path                       | Resolves to                                                       |
+| -------------------------- | ----------------------------------------------------------------- |
+| `prUrl`                    | The `prUrl` property of `result.data`.                            |
+| `findings[*].severity`     | The `severity` property of every element of the `findings` array. |
+| `any:checks[*].conclusion` | The `conclusion` property of any element of the `checks` array.   |
+| `issue.metadata.url`       | A nested object property.                                         |
+
+The grammar is intentionally minimal so workflow authors can read it in a sentence and tooling (Studio, linters) can parse it in a few lines. Richer expressions (filter predicates, JSONPath, CEL) are out of scope.
+
+### Path resolution
+
+A path is resolved by walking segments left-to-right against `result.data`:
+
+- A non-wildcard segment that doesn't exist on its parent object → resolution **fails**.
+- A `[*]` segment requires its parent to be an array. If the parent is not an array, resolution fails. If the parent is an empty array, expansion succeeds and the wildcard rule below applies.
+- Encountering `null` mid-path → resolution fails.
+
+A failed resolution is treated as a failed check inside `value` evaluators. The reasoning string names the missing segment.
+
+### Wildcard semantics
+
+When a path contains `[*]` and resolves successfully:
+
+- `all:` (default) — every resolved value MUST satisfy the operator. An empty array is vacuously true.
+- `any:` — at least one resolved value MUST satisfy the operator. An empty array is false.
+
+`output_required` follows the same rule. `output_required: [findings[*].severity]` means the `findings` array is present and every finding has a non-null `severity`. `output_required: ["any:findings[*].severity"]` means at least one finding does.
+
+### Judge mechanics
+
+#### Model selection
+
+Three layers of override, narrowest wins:
+
+1. Evaluator-level `model` field on a `judge` evaluator.
+2. Node-level `judge_model` field.
+3. Workflow-level `judge_model` field. Default `claude-haiku-4-5`.
+
+Judges return a single token verdict, so a small fast model is the right default.
+
+#### Cost gating
+
+Workflow-level `judge_budget` (integer, default `50`) caps the expected number of judge calls per workflow run. The executor SHOULD warn at load time when `count(judges) * estimated_runs` exceeds the budget. The budget is a soft signal in v1, not a hard runtime cap.
+
+#### Parse failures
+
+When the judge response cannot be parsed for the `pass_when` token (model returned garbage, timed out, errored), the executor:
+
+- Retries the judge call once.
+- If the second call also fails, the evaluator is recorded as `pass: false` with `reasoning: "judge parse failure"`.
+- A workflow author who wants a parse-failure to be a halt can wrap the judge in a stricter retry policy at the node level.
+
+### Aggregation and failure reporting
+
+A conforming executor:
+
+- **MUST** evaluate every declared evaluator (no fast-fail), so the workflow author sees every problem in one pass.
+- **MUST** populate `NodeResult.evals` with one [EvalResult](#evalresult-type) per evaluator, in the order they were declared.
+- **MUST** mark the node failed under `eval_policy: all_pass` if any evaluator fails. The node's `error` message is a structured list, one line per failing evaluator: `name (kind): reasoning`.
+- **MUST NOT** run `eval` when the AI model already failed the node. Eval only runs against successful node executions.
+
+A representative failure message:
+
+```
+eval failed (policy: all_pass):
+  - pr_was_created (function): required all of [github_create_pr] to succeed, called: [github_search_issues]
+  - pr_url_well_formed (value): output_required 'prUrl' missing segment 'prUrl'
+  - tests_present_when_pass_claimed (judge): test_status was 'pass' but test_files_changed was empty
+```
+
+### Worked example
+
+```yaml
+implement-fix:
+  name: Implement Fix
+  instruction: Open a PR that fixes the issue and verify CI is green.
+  skills:
+    - github
+  output:
+    type: object
+    properties:
+      prUrl:      { type: string }
+      branchName: { type: string }
+      test_status: { type: string, enum: [pass, fail, no-framework] }
+      test_files_changed: { type: array, items: { type: string } }
+      checks:
+        type: array
+        items:
+          type: object
+          properties:
+            name:       { type: string }
+            conclusion: { type: string }
+    required: [prUrl, branchName, test_status]
+  eval:
+    - name: pr_was_created
+      kind: function
+      rule:
+        all_tools_called: [github_create_pr]
+        no_tool_called:   [github_force_push]
+    - name: pr_url_well_formed
+      kind: value
+      rule:
+        output_required: [prUrl, branchName]
+        output_matches:
+          - { path: prUrl,                    matches: "^https://github.com/" }
+          - { path: branchName,               matches: "^sweny/" }
+          - { path: any:checks[*].conclusion, equals:  "success" }
+    - name: status_is_recognized
+      kind: value
+      rule:
+        output_matches:
+          - { path: test_status, in: [pass, fail, no-framework] }
+    - name: tests_present_when_pass_claimed
+      kind: judge
+      rubric: |
+        If result.data.test_status is "pass", does
+        result.data.test_files_changed contain at least one real test
+        file path? An empty array with status "pass" is a contract
+        violation. If status is anything else, this rule passes
+        vacuously.
+      pass_when: yes
+```
+
+### When to use eval
+
+- Use a `value` evaluator for _data-shape post-conditions_: facts about the structured output that you can express as a path and an operator.
+- Use a `function` evaluator for _trace-shape post-conditions_: a specific tool was, or was not, called.
+- Use a `judge` evaluator for _semantic_ or _conditional_ post-conditions: claims that depend on context, comparisons across fields, or anything outside the reach of a deterministic rule.
+- Use [conditional edges](/edges#conditional-routing) for _routing_: which node runs next based on the result.
+- Use the node's `output` JSON Schema for _shape_: the structural contract on the data. Eval is for the looser "did the model actually do the right thing" checks that JSON Schema can't express.
+
+## Examples
+
+### Minimal Node
+
+```yaml
+gather:
+  name: Gather Context
+  instruction: Pull error details, logs, and recent commits related to the alert.
+  skills:
+    - github
+    - sentry
+  max_turns: 80
+```
+
+### Node with Structured Output
+
+```yaml
+investigate:
+  name: Root Cause Analysis
+  instruction: >-
+    Classify each issue as novel or duplicate. Assess severity and
+    fix complexity for each finding.
+  max_turns: 50
+  skills:
+    - github
+    - linear
+  output:
+    type: object
+    properties:
+      findings:
+        type: array
+        items:
+          type: object
+          properties:
+            title: { type: string }
+            severity: { type: string, enum: [critical, high, medium, low] }
+            is_duplicate: { type: boolean }
+            fix_complexity: { type: string, enum: [simple, moderate, complex] }
+          required: [title, severity, is_duplicate]
+      novel_count: { type: number }
+      highest_severity: { type: string }
+    required: [findings, novel_count, highest_severity]
+```
+
+### Node with No Skills
+
+A node with no skills has no tools. The AI model executes the instruction using only its training and the accumulated context.
+
+```yaml
+summarize:
+  name: Summarize Findings
+  instruction: >-
+    Produce a concise summary of all findings for the notification.
+    Include severity, root cause, and links to created issues.
+```
+
+## Retry
+
+**Node-local self-healing on eval failure.** When `eval` fails, the
+executor re-invokes the LLM up to `max` additional times, prepending
+feedback derived from the failing evaluators.
+
+Triggered ONLY by eval failure, not by tool/API errors and not by
+`requires` failure. Re-running cannot fix upstream data problems.
+
+### Schema
+
+```yaml
+retry:
+  max: integer                      # ≥ 1
+  instruction:                      # optional
+    | string                        # static preamble
+    | { auto: true }                # LLM-generated diagnosis (default prompt)
+    | { reflect: string }           # LLM-generated diagnosis (author prompt)
+```
+
+### Modes
+
+| `instruction` value       | Behavior                                                                                                                            |
+| ------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| (omitted)                 | Default preamble: a structured list of failing evaluators (`name (kind): reasoning`, one per line) followed by "Fix and try again." |
+| `"static text"`           | Author's text + the structured failing-evaluator list appended.                                                                     |
+| `{ auto: true }`          | Executor calls `claude.ask` with a default reflection prompt; the response becomes preamble.                                        |
+| `{ reflect: "<prompt>" }` | Same as `auto`, but the author's `reflect` prompt is used as the diagnosis question.                                                |
+
+The preamble is prepended to the node's normal instruction so the LLM sees
+it before the original task. Each retry uses only the **latest** eval
+failure as feedback. Older errors are noise.
+
+### Reflection failure
+
+If `claude.ask` throws or returns empty during autonomous mode, the
+executor falls back to the default static preamble for that attempt and
+logs a warning. Reflection failure never escalates to a workflow failure.
+
+### Cost
+
+`retry × autonomous reflection` is up to `2 × max + 1` LLM calls per
+node (initial + N retries × 2 calls each). Workflow authors set the
+ceiling via `max`.
+
+### Trace and observer events
+
+Each attempt is recorded as its own `TraceStep` with a `retryAttempt`
+field (0-indexed). The executor emits a `node:retry` observer event
+before each retry attempt with `{ node, attempt, reason, preamble }`.
+
+### Example
+
+```yaml
+nodes:
+  open_pr:
+    name: Open PR
+    instruction: Open a PR with the fix
+    skills: [github]
+    eval:
+      - name: pr_was_created
+        kind: function
+        rule:
+          any_tool_called: [github_create_pr]
+      - name: pr_url_present
+        kind: value
+        rule:
+          output_required: [prUrl]
+    retry:
+      max: 2
+      instruction: { auto: true }
+```

@@ -1,0 +1,154 @@
+id: implement
+name: Implement Fix
+workflow_type: pr_review
+description: Implement a code fix for an issue and open a pull request
+entry: analyze
+nodes:
+  analyze:
+    name: Analyze Issue
+    instruction: |-
+      Read the issue details and understand what needs to be fixed:
+
+      1. Fetch the issue from the tracker (GitHub or Linear).
+      2. **Check for an existing open PR for this issue.** Call
+         `github_search_issues` (GitHub's `/search/issues` endpoint returns
+         both issues and PRs) with `type:pr state:open` and the issue
+         identifier wrapped in brackets — e.g. query
+         `[OFF-1234] in:title type:pr state:open`. If the response contains
+         one or more PRs whose title starts with `[<issueIdentifier>]`,
+         STOP analysis. Output `existing_pr_url`
+         (the URL of the open PR) and a short `issue_summary` noting the
+         skip; leave `fix_plan` set to a one-line "Skip: open PR
+         <url> already exists". The workflow will route to `notify` and
+         the team will be told the prior PR is still pending.
+         Rationale: re-implementing while an open PR exists produces a
+         duplicate (or worse, the agent closes its own prior PR mid-run
+         and opens a new one — exactly the thrash seen in
+         `letsoffload/permit-service` PR #81 → #82 and
+         `letsoffload/offload` PR #572 → #573).
+      3. Read the relevant source files to understand the current code.
+      4. Identify the exact files and lines that need to change.
+      5. Plan the fix approach.
+
+      Output a clear analysis of what needs to change and why.
+    skills:
+      - github
+      - linear
+    output:
+      type: object
+      properties:
+        issue_summary:
+          type: string
+        files_to_change:
+          type: array
+          items:
+            type: string
+        fix_plan:
+          type: string
+        risk_level:
+          type: string
+          enum:
+            - low
+            - medium
+            - high
+        existing_pr_url:
+          type: string
+          description: |
+            URL of an open PR found in step 2 whose title starts with the
+            issue identifier in brackets. Set ONLY when a prior PR exists
+            and the analyze node is short-circuiting. Triggers the
+            `analyze → notify` edge.
+          pattern: "^https?://"
+      required:
+        - issue_summary
+        - fix_plan
+  implement:
+    name: Implement Fix
+    instruction: |-
+      Implement the planned fix:
+
+      1. Create a feature branch. The branch name MUST start with the issue
+         identifier from `context.input.issueIdentifier`, lowercased, followed
+         by a short kebab-case description: e.g. `off-1234-fix-null-check`.
+      2. Make the necessary code changes.
+      3. Ensure changes are minimal and focused — fix the bug, nothing more.
+      4. Stage and commit. Start the commit message with the issue identifier
+         in brackets, e.g. `[OFF-1234] fix: guard null projectId`.
+
+      Stop after the commit. Do NOT push or open the PR — the dedicated `create_pr`
+      node handles that via `github_create_pr` and its eval gate is what unblocks
+      the rest of the workflow.
+
+      If the fix is too risky or complex, explain why and skip.
+    skills:
+      - github
+    # Same rationale as the triage workflow: keep the implement node focused
+    # on the repo. Bash stays available because `git add`/`git commit` and
+    # test runners are essential.
+    disallowed_tools:
+      - WebFetch
+      - WebSearch
+  create_pr:
+    name: Open Pull Request
+    instruction: >-
+      Open a pull request for the fix:
+
+
+      1. Push the branch to the remote.
+
+      2. Create the PR using `github_create_pr`. The PR title MUST start with the issue identifier in
+      brackets: `[{context.input.issueIdentifier}] type: short description` (e.g. `[OFF-1234] fix: guard
+      null projectId`).
+
+      3. Reference the original issue in the PR body. If the issue tracker is Linear, include the line
+      "Fixes {context.input.issueIdentifier}" (e.g. "Fixes OFF-1234") so Linear links the PR and moves
+      the issue to Done on merge.
+
+      4. Pass `labels: ["sweny", "agent", "task"]` to `github_create_pr` (or `["sweny", "agent", "feature"]` if the issue is a feature request).
+
+
+      If context.prTemplate is provided, use it as the format for the PR body. Otherwise use a clear structure with:
+      Summary, Changes, Testing, and Related Issues.
+
+
+      If context.cloudRunId is provided, append this HTML comment to the end of the PR body: <!--
+      sweny:run_id:{context.cloudRunId} -->
+
+
+      Return the PR URL.
+    skills:
+      - github
+  notify:
+    name: Notify
+    instruction: |-
+      Send a notification about the implementation result:
+
+      1. Include: issue reference, PR link, brief summary of changes.
+      2. Keep it concise — one message, not a wall of text.
+    skills:
+      - slack
+      - notification
+  skip:
+    name: Skip — Too Complex
+    instruction: |-
+      The fix was determined to be too complex or risky for automated implementation.
+      Add a comment to the issue explaining what was found and why it needs manual attention.
+    skills:
+      - github
+      - linear
+edges:
+  - from: analyze
+    to: notify
+    when: analyze.existing_pr_url is set (an open PR for this issue already exists; skip the implement and create_pr nodes)
+  - from: analyze
+    to: implement
+    when: Fix risk level is low or medium and a clear plan exists
+  - from: analyze
+    to: skip
+    when: Fix is too complex, risky, or unclear
+  - from: implement
+    to: create_pr
+  - from: skip
+    to: notify
+  - from: create_pr
+    to: notify

@@ -1,5 +1,47 @@
 # @sweny-ai/web
 
+## 0.1.8
+
+### Patch Changes
+
+- @sweny-ai/studio@8.0.0
+
+## 0.1.7
+
+### Patch Changes
+
+- @sweny-ai/studio@7.0.0
+
+## 0.1.6
+
+### Patch Changes
+
+- @sweny-ai/studio@6.0.0
+
+## 0.1.5
+
+### Patch Changes
+
+- @sweny-ai/studio@5.0.0
+
+## 0.1.4
+
+### Patch Changes
+
+- Updated dependencies [1b11317]
+- Updated dependencies [17ce7ac]
+- Updated dependencies [da1d38a]
+- Updated dependencies [943fc8d]
+  - @sweny-ai/studio@4.0.0
+
+## 0.1.3
+
+### Patch Changes
+
+- Updated dependencies [815d361]
+- Updated dependencies [e36f470]
+  - @sweny-ai/studio@3.0.0
+
 ## 0.1.2
 
 ### Patch Changes

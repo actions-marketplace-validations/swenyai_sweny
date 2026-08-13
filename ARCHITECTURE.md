@@ -1,56 +1,86 @@
-# What's Open Source
+# Architecture
 
-## Open (sweny repo)
+## Current Architecture
 
-- **engine** — recipe runner, step execution, cycle detection
-- **providers** — all integrations (Datadog, Linear, GitHub, etc.)
-- **action** — GitHub Action wrapper
-- **cli** — `sweny` CLI for local/CI use
-- **agent** — Claude Code subprocess management
+SWEny is an open-source framework for building and running AI agent workflows as YAML DAGs. Each node in the graph contains a natural language instruction, a set of skills (tool bundles), and optional structured output. Edges can be unconditional or use natural language conditions evaluated by the AI model at runtime.
 
-## Open (sweny-worker, coming soon)
+The Action and CLI are free and run in **your** environment — your CI runner, your terminal, your compute. SWEny never executes code on our infrastructure.
 
-- **worker** — the cloud job executor (queue consumer + runRecipe)
-  The worker is just the open-source engine running inside a queue.
-  Opening it lets customers audit and verify what runs on their data.
+### Packages
 
-## Closed (cloud repo — sweny.ai platform)
+| Package | Dir | Published | What it does |
+|---------|-----|-----------|--------------|
+| `@sweny-ai/core` | `packages/core` | npm | Skills, DAG executor, CLI |
+| `@sweny-ai/studio` | `packages/studio` | npm | Visual DAG editor and execution monitor |
+| `@sweny-ai/mcp` | `packages/mcp` | npm | MCP server for Claude Code / Desktop |
+| — | `packages/plugin` | no (marketplace) | Claude Code plugin: skills, MCP tools, agent, hooks |
+| `@sweny-ai/action` | `packages/action` | no (private) | GitHub Action entrypoint — bundled into root `dist/` |
+| — | `packages/web` | no (private) | Docs site (Vercel → docs.sweny.ai) |
 
-- **API** — multi-tenant orchestration, billing, auth, org management
-- **UI** — dashboard, settings, job history
-- **Infrastructure** — deployment, scaling, monitoring
+### Execution Flow
 
-## Why this split?
+When a workflow runs (via CLI or GitHub Action):
 
-The value of sweny.ai cloud is NOT in the code that executes jobs (that's open).
-The value is in: managed execution, team collaboration, result history, integrations
-UI, compliance features (BYOK, TEE), and operational reliability.
+1. The executor loads the workflow YAML, validates the DAG, and resolves skills
+2. Starting from the `entry` node, it builds context (workflow input + prior node outputs)
+3. Each node's instruction (augmented with rules/context) is sent to the AI model with scoped tools
+4. The model executes, tool calls are tracked, and structured output is captured
+5. Edges are evaluated — unconditional edges follow deterministically, conditional edges are routed by the AI model
+6. The trace (ordered steps + routing decisions) is emitted as events throughout
 
-You can run the engine yourself for free. You pay us to manage it at scale,
-keep it running, and give your team visibility.
+All execution happens locally. The executor has an opt-in reporting path that emits a structured summary (status, duration, recommendations) when `SWENY_CLOUD_TOKEN` is set. No code, no diffs, no secrets. Token minting is not currently exposed, so this path is dormant by default; the hosted service behind it is in active development.
 
-## Job Execution Flow
+### What "scoped tools" means
 
-When sweny.ai cloud runs a job:
+Each node declares `skills`, and SWEny wires only those skills' MCP servers into that node's invocation. In that sense the MCP tool surface is scoped per node.
 
-1. The API dispatches a `WorkerJobPayload` onto a BullMQ queue
-2. The worker (open-source) picks up the job
-3. The worker fetches the bundle encryption key (BEK) from the internal API using a one-time job token
-4. The worker decrypts credentials in memory, clones the repo, and runs `runRecipe()` from `@sweny-ai/engine`
-5. The worker submits a structured `JobOutcome` back to the internal API
-6. The API persists job metadata and notifies the UI
+What SWEny does **not** scope: the underlying Claude Code subprocess runs with `permissionMode: "bypassPermissions"`, which keeps the built-in Bash/Read/Write/Edit tools available without permission prompting. This is intentional — SWEny targets CI-style autonomous runs where interactive approval is not an option, and the agent needs these capabilities to do the work. If you need a stricter sandbox, run the Action in a container that constrains the filesystem and network instead of looking for a flag inside SWEny.
 
-Steps 3–5 are the open-source worker. Steps 1, 2, and 6 are the closed platform.
-No proprietary business logic lives in the worker — it is pure engine orchestration.
+`eval` evaluators are the primary mechanism for making a node's behavior auditable. Each node declares a list of named evaluators with `kind: value | function | judge`. `function` rules (`any_tool_called`, `all_tools_called`, `no_tool_called`) and `value` rules (`output_required`, `output_matches`) are checked deterministically against the recorded tool outcomes and structured output. `judge` evaluators call a small Claude model with a rubric for the conditional and semantic cases the deterministic kinds can't express. See [spec.sweny.ai/nodes/#eval](https://spec.sweny.ai/nodes/#eval).
 
-## Audit Path
+### Skills
 
-Customers who want to verify what ran on their data can:
+Skills are composable tool bundles. Three types:
 
-1. Check the open-source worker source at `packages/worker/` in this repo
-2. Compare the published Docker image digest against the build attestation in GitHub Releases
-3. Use `packages/worker/verify-build.sh` to verify a specific image was built from a known commit
-4. Run the worker themselves in their own VPC (BYO Worker tier)
+- **Built-in** — set the credential, the skill is ready (e.g., `github`, `linear`, `sentry`, `datadog`)
+- **Custom** — author a `SKILL.md` with instructions and/or an MCP server declaration
+- **MCP** — any MCP-compatible server, wired per-node via skill config
 
-The `WorkerJobPayload` type (in `packages/shared/src/worker-payload.ts`) defines the exact
-public interface: no billing info, no internal org state, no platform secrets cross this boundary.
+Custom skills are harness-agnostic: the same `SKILL.md` works in Claude Code, Codex, Gemini CLI, and SWEny.
+
+See [spec.sweny.ai/skills](https://spec.sweny.ai/skills/) for the formal specification.
+
+### MCP Transport Standards and npx
+
+General rule: **don't use `npx -y`** — runtime package downloads bypass lockfiles and
+security audits, and the package version is non-deterministic.
+
+**Exception**: stdio MCP servers are allowed via `npx -y` when no public HTTP MCP
+endpoint exists and the package is official first-party vendor code (or the
+de-facto community standard where no first-party alternative exists). Every
+exception must declare its reason in code.
+
+**Authoritative list:** `packages/core/src/mcp-catalog.ts` — each entry's
+`npxExceptionReason` field names the server, its package, and why the exception is
+acceptable. A module-load assertion and `mcp-catalog.test.ts` fail the build if a
+stdio entry is missing its reason or an http entry declares one. Update the code
+and the notes here together whenever a provider is added, removed, or changes
+transport.
+
+Currently stdio (via `npx -y`): GitHub, GitLab, Sentry, Slack, Notion, Monday.com,
+Jira/Confluence (community `@sooperset/mcp-atlassian` — documented in the catalog
+as a community exception; revisit when Atlassian ships a first-party server).
+
+Currently http (no exception needed): Datadog, Linear, New Relic, BetterStack,
+PagerDuty.
+
+Users can override any auto-injected server with a pre-installed binary by setting
+`mcp-servers-json` in `.sweny.yml`.
+
+---
+
+## Where to look next
+
+- [spec.sweny.ai](https://spec.sweny.ai) — the formal workflow specification (nodes, edges, eval, requires, retry, sources, skills).
+- [docs.sweny.ai](https://docs.sweny.ai) — narrative guides, getting-started flows, CLI reference.
+- [`packages/core/src/mcp-catalog.ts`](packages/core/src/mcp-catalog.ts) — single source of truth for skill ↔ MCP wiring.

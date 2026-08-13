@@ -1,19 +1,19 @@
 import { create } from "zustand";
 import { temporal } from "zundo";
 import { produce } from "immer";
-import type { RecipeDefinition, StateDefinition, WorkflowPhase, ExecutionEvent, StepResult } from "@sweny-ai/engine";
-import { triageDefinition } from "@sweny-ai/engine";
+import type { Workflow, Node, Edge, ExecutionEvent, NodeResult } from "@sweny-ai/core";
+import { triageWorkflow } from "@sweny-ai/core/workflows";
 
 export type StudioMode = "design" | "simulate" | "live";
 
 export interface ExecutionSlice {
   mode: StudioMode;
-  // Which state is currently executing (entered but not yet exited)
-  currentStateId: string | null;
-  // Results of states that have completed
-  completedStates: Record<string, StepResult>;
-  // Overall recipe status
-  executionStatus: "idle" | "running" | "completed" | "failed" | "partial";
+  // Which node is currently executing (entered but not yet exited)
+  currentNodeId: string | null;
+  // Results of nodes that have completed
+  completedNodes: Record<string, NodeResult>;
+  // Overall workflow status
+  executionStatus: "idle" | "running" | "completed" | "failed";
   // For live mode: connection info
   liveConnection: {
     url: string;
@@ -30,44 +30,52 @@ export interface ExecutionSlice {
 }
 
 // What the user has selected on the canvas
-export type Selection = { kind: "state"; id: string } | { kind: "edge"; source: string; outcome: string } | null;
+export type Selection =
+  { kind: "node"; id: string } | { kind: "edge"; id: string; edgeIndex: number; from: string; to: string } | null;
 
 export interface EditorState extends ExecutionSlice {
-  definition: RecipeDefinition;
+  workflow: Workflow;
   selection: Selection;
   isLayoutStale: boolean; // true when structure changed and ELK needs to re-run
 
   // Setters
-  setDefinition(def: RecipeDefinition): void;
+  setWorkflow(wf: Workflow): void;
   setSelection(sel: Selection): void;
 
-  // State mutations (all affect `definition`)
-  updateRecipeMeta(patch: Partial<Pick<RecipeDefinition, "name" | "description" | "version">>): void;
-  addState(id: string, phase: WorkflowPhase): void;
-  deleteState(id: string): void;
-  updateState(id: string, patch: Partial<StateDefinition>): void;
-  setInitial(id: string): void;
+  // Workflow meta mutations
+  updateWorkflowMeta(patch: Partial<Pick<Workflow, "name" | "description">>): void;
+  setEntry(id: string): void;
 
-  // Transition mutations
-  addTransition(sourceId: string, outcome: string, targetId: string): void;
-  updateTransitionOutcome(sourceId: string, oldOutcome: string, newOutcome: string): void;
-  updateTransitionTarget(sourceId: string, outcome: string, newTarget: string): void;
-  deleteTransition(sourceId: string, outcome: string): void;
+  // Node mutations (all affect `workflow`)
+  addNode(id: string): void;
+  deleteNode(id: string): void;
+  updateNode(id: string, patch: Partial<Node>): void;
+  /** Rename a node ID and cascade all references. Returns an error string on failure, null on success. */
+  renameNode(oldId: string, newId: string): string | null;
+  /** Clone a node with a unique ID suffix. Returns the new node's ID. */
+  duplicateNode(id: string): string | null;
+  /** Remove all edges connected to a node (both incoming and outgoing). */
+  disconnectNode(id: string): void;
+
+  // Edge mutations
+  addEdge(from: string, to: string, when?: string): void;
+  updateEdge(edgeIndex: number, patch: { when?: string; to?: string; max_iterations?: number }): void;
+  deleteEdge(edgeIndex: number): void;
 
   markLayoutFresh(): void;
 }
 
 export const useEditorStore = create<EditorState>()(
   temporal(
-    (set, _get) => ({
-      definition: triageDefinition as RecipeDefinition,
+    (set, get) => ({
+      workflow: triageWorkflow,
       selection: null,
       isLayoutStale: false,
 
       // ExecutionSlice initial state
       mode: "design" as StudioMode,
-      currentStateId: null,
-      completedStates: {},
+      currentNodeId: null,
+      completedNodes: {},
       executionStatus: "idle" as const,
       liveConnection: null,
 
@@ -81,21 +89,23 @@ export const useEditorStore = create<EditorState>()(
       applyEvent: (event: ExecutionEvent) =>
         set(
           produce((s: EditorState) => {
-            if (event.type === "recipe:start") {
-              s.currentStateId = null;
-              s.completedStates = {};
+            if (event.type === "workflow:start") {
+              s.currentNodeId = null;
+              s.completedNodes = {};
               s.executionStatus = "running";
             }
-            if (event.type === "state:enter") {
-              s.currentStateId = event.stateId;
+            if (event.type === "node:enter") {
+              s.currentNodeId = event.node;
             }
-            if (event.type === "state:exit") {
-              s.currentStateId = null;
-              s.completedStates[event.stateId] = event.result;
+            if (event.type === "node:exit") {
+              s.currentNodeId = null;
+              s.completedNodes[event.node] = event.result;
             }
-            if (event.type === "recipe:end") {
-              s.currentStateId = null;
-              s.executionStatus = event.status;
+            if (event.type === "workflow:end") {
+              s.currentNodeId = null;
+              const results = event.results;
+              const anyFailed = Object.values(results).some((r) => r.status === "failed");
+              s.executionStatus = anyFailed ? "failed" : "completed";
             }
           }),
         ),
@@ -103,8 +113,8 @@ export const useEditorStore = create<EditorState>()(
       resetExecution: () =>
         set(
           produce((s: EditorState) => {
-            s.currentStateId = null;
-            s.completedStates = {};
+            s.currentNodeId = null;
+            s.completedNodes = {};
             s.executionStatus = "idle";
             s.liveConnection = null;
           }),
@@ -117,10 +127,10 @@ export const useEditorStore = create<EditorState>()(
           }),
         ),
 
-      setDefinition: (def: RecipeDefinition) =>
+      setWorkflow: (wf: Workflow) =>
         set(
           produce((s: EditorState) => {
-            s.definition = def;
+            s.workflow = wf;
             s.isLayoutStale = true;
           }),
         ),
@@ -139,165 +149,212 @@ export const useEditorStore = create<EditorState>()(
           }),
         ),
 
-      updateRecipeMeta: (patch: Partial<Pick<RecipeDefinition, "name" | "description" | "version">>) =>
+      updateWorkflowMeta: (patch: Partial<Pick<Workflow, "name" | "description">>) =>
         set(
           produce((s: EditorState) => {
-            if (patch.name !== undefined) s.definition.name = patch.name;
-            if (patch.description !== undefined) s.definition.description = patch.description;
-            if (patch.version !== undefined) s.definition.version = patch.version;
+            if (patch.name !== undefined) s.workflow.name = patch.name;
+            if (patch.description !== undefined) s.workflow.description = patch.description;
           }),
         ),
 
-      addState: (id: string, phase: WorkflowPhase) =>
+      setEntry: (id: string) =>
         set(
           produce((s: EditorState) => {
-            if (!id || s.definition.states[id]) return;
-            s.definition.states[id] = { phase };
+            s.workflow.entry = id;
             s.isLayoutStale = true;
           }),
         ),
 
-      deleteState: (id: string) =>
+      addNode: (id: string) =>
         set(
           produce((s: EditorState) => {
-            delete s.definition.states[id];
-            // Remove references in other states
-            for (const state of Object.values(s.definition.states)) {
-              if (state.next === id) {
-                delete state.next;
-              }
-              if (state.on) {
-                for (const outcome of Object.keys(state.on)) {
-                  if (state.on[outcome] === id) {
-                    delete state.on[outcome];
-                  }
-                }
-                if (Object.keys(state.on).length === 0) {
-                  delete state.on;
-                }
-              }
+            if (!id || s.workflow.nodes[id]) return;
+            s.workflow.nodes[id] = {
+              name: id,
+              instruction: "",
+              skills: [],
+            };
+            s.isLayoutStale = true;
+          }),
+        ),
+
+      deleteNode: (id: string) =>
+        set(
+          produce((s: EditorState) => {
+            delete s.workflow.nodes[id];
+            // Remove edges that reference this node
+            const edgesBefore = s.workflow.edges.length;
+            s.workflow.edges = s.workflow.edges.filter((e) => e.from !== id && e.to !== id);
+            const edgesRemoved = s.workflow.edges.length !== edgesBefore;
+            // Fix entry if needed
+            if (s.workflow.entry === id) {
+              const remaining = Object.keys(s.workflow.nodes);
+              s.workflow.entry = remaining[0] ?? "";
             }
-            // Fix initial if needed
-            if (s.definition.initial === id) {
-              const remaining = Object.keys(s.definition.states);
-              s.definition.initial = remaining[0] ?? "";
-            }
-            // Clear selection if this state was selected
-            if (s.selection?.kind === "state" && s.selection.id === id) {
+            // Clear selection if this node was selected, or if an edge is
+            // selected and we just dropped one (its positional index may now
+            // point at a different edge).
+            if (s.selection?.kind === "node" && s.selection.id === id) {
+              s.selection = null;
+            } else if (edgesRemoved && s.selection?.kind === "edge") {
               s.selection = null;
             }
             s.isLayoutStale = true;
           }),
         ),
 
-      updateState: (id: string, patch: Partial<StateDefinition>) =>
+      updateNode: (id: string, patch: Partial<Node>) =>
         set(
           produce((s: EditorState) => {
-            const state = s.definition.states[id];
-            if (!state) return;
-            const structural = patch.next !== undefined || patch.on !== undefined;
-            if (patch.phase !== undefined) state.phase = patch.phase;
-            if (patch.description !== undefined) state.description = patch.description;
-            if (patch.critical !== undefined) state.critical = patch.critical;
-            if (patch.next !== undefined) state.next = patch.next;
-            if (patch.on !== undefined) state.on = patch.on;
-            if (structural) {
+            const node = s.workflow.nodes[id];
+            if (!node) return;
+            if (patch.name !== undefined) node.name = patch.name;
+            if (patch.instruction !== undefined) node.instruction = patch.instruction;
+            if (patch.skills !== undefined) node.skills = patch.skills;
+            if (patch.output !== undefined) node.output = patch.output;
+          }),
+        ),
+
+      duplicateNode: (id: string): string | null => {
+        const state = get();
+        const node = state.workflow.nodes[id];
+        if (!node) return null;
+        const existing = new Set(Object.keys(state.workflow.nodes));
+        let newId = `${id}_copy`;
+        let counter = 1;
+        while (existing.has(newId)) {
+          newId = `${id}_copy_${counter++}`;
+        }
+        set(
+          produce((s: EditorState) => {
+            s.workflow.nodes[newId] = {
+              name: `${node.name} (copy)`,
+              instruction: node.instruction,
+              skills: [...node.skills],
+              ...(node.output ? { output: structuredClone(node.output) } : {}),
+            };
+            s.isLayoutStale = true;
+          }),
+        );
+        return newId;
+      },
+
+      disconnectNode: (id: string) =>
+        set(
+          produce((s: EditorState) => {
+            const before = s.workflow.edges.length;
+            s.workflow.edges = s.workflow.edges.filter((e) => e.from !== id && e.to !== id);
+            if (s.workflow.edges.length !== before) {
+              s.isLayoutStale = true;
+              // An edge selection's positional index may now be stale.
+              if (s.selection?.kind === "edge") {
+                s.selection = null;
+              }
+            }
+          }),
+        ),
+
+      renameNode: (oldId: string, newId: string): string | null => {
+        const trimmed = newId.trim();
+        if (!trimmed) return "Node ID cannot be empty";
+        if (!/^[a-zA-Z0-9_-]+$/.test(trimmed)) {
+          return "Node IDs may only contain letters, digits, hyphens, and underscores";
+        }
+        if (trimmed === oldId) return null;
+        const state = get();
+        if (state.workflow.nodes[trimmed]) {
+          return `A node with ID "${trimmed}" already exists`;
+        }
+        if (!state.workflow.nodes[oldId]) {
+          return `Node "${oldId}" does not exist`;
+        }
+        set(
+          produce((s: EditorState) => {
+            const node = s.workflow.nodes[oldId];
+            s.workflow.nodes[trimmed] = node;
+            delete s.workflow.nodes[oldId];
+            if (s.workflow.entry === oldId) s.workflow.entry = trimmed;
+            // Update edges
+            for (const edge of s.workflow.edges) {
+              if (edge.from === oldId) edge.from = trimmed;
+              if (edge.to === oldId) edge.to = trimmed;
+            }
+            if (s.selection?.kind === "node" && s.selection.id === oldId) {
+              s.selection = { kind: "node", id: trimmed };
+            }
+            s.isLayoutStale = true;
+          }),
+        );
+        return null;
+      },
+
+      addEdge: (from: string, to: string, when?: string) =>
+        set(
+          produce((s: EditorState) => {
+            // Block duplicate unconditional edges between the same pair.
+            // Multiple conditional edges (different `when`) are allowed.
+            if (!when) {
+              const exists = s.workflow.edges.some((e) => e.from === from && e.to === to && !e.when);
+              if (exists) return;
+            }
+            const edge: Edge = { from, to };
+            if (when) edge.when = when;
+            s.workflow.edges.push(edge);
+            s.isLayoutStale = true;
+          }),
+        ),
+
+      updateEdge: (edgeIndex: number, patch: { when?: string; to?: string; max_iterations?: number }) =>
+        set(
+          produce((s: EditorState) => {
+            const edge = s.workflow.edges[edgeIndex];
+            if (!edge) return;
+            if (patch.when !== undefined) {
+              if (patch.when) {
+                edge.when = patch.when;
+              } else {
+                delete edge.when;
+              }
+            }
+            if (patch.max_iterations !== undefined) {
+              if (patch.max_iterations > 0) {
+                edge.max_iterations = patch.max_iterations;
+              } else {
+                delete edge.max_iterations;
+              }
+            }
+            if (patch.to !== undefined) {
+              edge.to = patch.to;
               s.isLayoutStale = true;
             }
           }),
         ),
 
-      setInitial: (id: string) =>
+      deleteEdge: (edgeIndex: number) =>
         set(
           produce((s: EditorState) => {
-            s.definition.initial = id;
-          }),
-        ),
-
-      addTransition: (sourceId: string, outcome: string, targetId: string) =>
-        set(
-          produce((s: EditorState) => {
-            const state = s.definition.states[sourceId];
-            if (!state) return;
-            if (outcome === "→") {
-              state.next = targetId;
-            } else {
-              if (!state.on) state.on = {};
-              state.on[outcome] = targetId;
+            let removed = false;
+            if (edgeIndex >= 0 && edgeIndex < s.workflow.edges.length) {
+              s.workflow.edges.splice(edgeIndex, 1);
+              removed = true;
             }
-            s.isLayoutStale = true;
-          }),
-        ),
-
-      updateTransitionOutcome: (sourceId: string, oldOutcome: string, newOutcome: string) =>
-        set(
-          produce((s: EditorState) => {
-            const state = s.definition.states[sourceId];
-            if (!state) return;
-
-            let target: string | undefined;
-
-            if (oldOutcome === "→") {
-              target = state.next;
-              delete state.next;
-            } else {
-              target = state.on?.[oldOutcome];
-              if (state.on) delete state.on[oldOutcome];
-            }
-
-            if (target === undefined) return;
-
-            if (newOutcome === "→") {
-              state.next = target;
-              if (state.on && Object.keys(state.on).length === 0) {
-                delete state.on;
-              }
-            } else {
-              if (!state.on) state.on = {};
-              state.on[newOutcome] = target;
-            }
-          }),
-        ),
-
-      updateTransitionTarget: (sourceId: string, outcome: string, newTarget: string) =>
-        set(
-          produce((s: EditorState) => {
-            const state = s.definition.states[sourceId];
-            if (!state) return;
-            if (outcome === "→") {
-              state.next = newTarget;
-            } else if (state.on) {
-              state.on[outcome] = newTarget;
-            }
-          }),
-        ),
-
-      deleteTransition: (sourceId: string, outcome: string) =>
-        set(
-          produce((s: EditorState) => {
-            const state = s.definition.states[sourceId];
-            if (!state) return;
-            if (outcome === "→") {
-              delete state.next;
-            } else {
-              if (state.on) {
-                delete state.on[outcome];
-                if (Object.keys(state.on).length === 0) {
-                  delete state.on;
-                }
-              }
+            // Selection carries a positional edgeIndex. Removing any edge can
+            // shift the indices of the others, so clear an edge selection on
+            // every successful removal — not just an exact-index match — or it
+            // can end up pointing at (and mutating) the wrong edge.
+            if (removed && s.selection?.kind === "edge") {
+              s.selection = null;
             }
             s.isLayoutStale = true;
           }),
         ),
     }),
     {
-      // Only track `definition` in undo history — not selection or isLayoutStale
-      partialize: (state) => ({ definition: state.definition }),
+      // Only track `workflow` in undo history — not selection or isLayoutStale
+      partialize: (state) => ({ workflow: state.workflow }),
     },
   ),
 );
 
 // Expose the temporal API for undo/redo
-// useEditorStore.temporal is typed via the zundo mutation: ['temporal', StoreApi<TemporalState<...>>]
 export const useTemporalStore = () => useEditorStore.temporal;
